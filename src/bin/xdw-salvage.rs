@@ -43,8 +43,8 @@ OPTIONS:
     -h, --help          this text
 
 Pages printed through the vendor's driver hold their image in a coding this
-tool does not decode; they are reported, never guessed at. Protected documents
-are refused.
+tool decodes when supported; anything it cannot recover is reported, never
+guessed at. Protected documents are refused.
 ";
 
 /// Print a line, and give up quietly if the reader has gone away.
