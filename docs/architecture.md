@@ -30,7 +30,7 @@ adapters (PDF / HTML / CLI)
 
 具体的な XDWコンテナ／ページ解析、LZH実装、埋め込みファイル検出、ローカルファイル読み込みは `infrastructure` に集約しています。標準構成は `infrastructure::local_service()` で生成できます。`xdw_document` と `xdw_page` は解析結果をドメインモデルへ変換する境界で、`xdw_properties` は文書プロパティブロックから回転・表示用紙・注釈を取り出します。
 
-メタファイルは `emf`（32 ビット形式）と `wmf`（16 ビット形式）が読み、共通の GDI 状態（座標変換、オブジェクト、クリップ、パス、メーカー private コメント）は `gdi::Canvas` にまとめています。`dib` は内包ビットマップを展開し、`deflate` と `png` は出力側が画像を格納するための依存なしの圧縮器です。
+メタファイルは `emf`（32 ビット形式）と `wmf`（16 ビット形式）が読み、共通の GDI 状態（座標変換、オブジェクト、クリップ、パス、メーカー private コメント）は `gdi::Canvas` にまとめています。`dib` は内包ビットマップを展開し、`deflate` と `png` は出力側が画像を格納するための圧縮・コンテナ処理です。zlib 圧縮には `miniz_oxide` を使用します。
 
 ## adapters
 

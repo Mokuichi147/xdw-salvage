@@ -678,7 +678,7 @@ BITMAPINFOHEADER(40) + Web セーフ 216 色パレット(864) = 904 バイト（
 展開した DIB は無圧縮の `BI_RGB`（1/4/8/24 bpp）か `BI_RLE4`/`BI_RLE8` で、いずれも標準です。
 
 本クレートは帯を展開し、PDF には `FlateDecode` の `Indexed`（パレット付き）画像として、
-HTML には PNG として入れます。zlib 圧縮器は依存クレートなしで `infrastructure/deflate.rs` に持っています。
+HTML には PNG として入れます。zlib 圧縮には `miniz_oxide` を使い、PNG チャンクの CRC-32 は `infrastructure/deflate.rs` で計算します。
 
 ### 8.3 罫線と塗りは「元画像のない BITBLT」
 

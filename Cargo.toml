@@ -12,6 +12,7 @@ exclude = ["/samples"]
 
 [dependencies]
 encoding_rs = "=0.8.41"
+miniz_oxide = "=0.8.9"
 
 [lib]
 name = "xdw_salvage"

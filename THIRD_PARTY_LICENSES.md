@@ -24,3 +24,17 @@ Redistribution and use in source and binary forms, with or without modification,
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 コード部分のライセンス本文は、[`encoding_rs` の配布物](https://crates.io/crates/encoding_rs/0.8.41)に含まれる `LICENSE-APACHE` および `LICENSE-MIT` を参照してください。
+
+## miniz_oxide 0.8.9
+
+zlib / DEFLATE 圧縮に [`miniz_oxide`](https://github.com/Frommi/miniz_oxide) を使用しています。
+
+- ライセンス: MIT、Zlib、または Apache-2.0
+- `miniz_oxide` のライセンス本文と著作権表示は、[配布物](https://crates.io/crates/miniz_oxide/0.8.9)に含まれる `LICENSE`、`LICENSE-ZLIB.md`、`LICENSE-APACHE.md` を参照してください。
+
+### adler2 2.0.1
+
+`adler2` は `miniz_oxide` が使用する間接依存です。
+
+- ライセンス: 0BSD、MIT、または Apache-2.0
+- [配布物](https://crates.io/crates/adler2/2.0.1)のライセンス本文と著作権表示を保持してください。
