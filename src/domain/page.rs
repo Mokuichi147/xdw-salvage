@@ -40,6 +40,22 @@ pub enum PageData {
     Bare { offset: usize, len: usize },
 }
 
+/// ページの上に重ねて描かれる図形データ。ページ自身の重ね描きか、注釈。
+///
+/// 文書プロパティブロックの中に、ページ本体と同じ符号化で格納されている。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overlay {
+    /// 本体と同じ保存形態コード。
+    pub kind: u64,
+    /// 展開後の長さ。
+    pub expanded: usize,
+    /// 独自圧縮されたままのデータ。
+    pub coded: Vec<u8>,
+    /// 注釈の位置と大きさ（x, y, 幅, 高さ。100分の1ミリメートル単位）。
+    /// `None` はページ全体に重なる。
+    pub area: Option<(u32, u32, u32, u32)>,
+}
+
 /// ページテーブル内のエントリ種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -78,6 +94,10 @@ pub struct Page {
     pub paper: Option<(u32, u32)>,
     /// ページが記録しているピクセルサイズ。
     pub pixels: Option<(u32, u32)>,
+    /// 表示時に時計回りに加える回転角（度）。文書プロパティに由来する。
+    pub rotation: u16,
+    /// ページに重ねて描かれる図形。文書プロパティに由来する。
+    pub overlays: Vec<Overlay>,
     pub data: PageData,
     /// 未解釈のフィールドタグ。
     pub unknown_fields: Vec<u8>,
@@ -105,6 +125,17 @@ impl Page {
             .map(|(w, h)| (w as f32 * 0.72 / 25.4, h as f32 * 0.72 / 25.4))
     }
 
+    /// 回転後に見える向きの用紙サイズをPDFポイントへ変換する。
+    pub fn shown_points(&self) -> Option<(f32, f32)> {
+        self.paper_points().map(|(w, h)| {
+            if self.rotation % 180 == 90 {
+                (h, w)
+            } else {
+                (w, h)
+            }
+        })
+    }
+
     /// レポート用の保存形態名。
     pub fn kind_name(&self) -> &'static str {
         match self.data {
@@ -118,6 +149,22 @@ impl Page {
 
     /// レポート用の1行説明。
     pub fn describe(&self) -> String {
+        let mut line = self.describe_data();
+        if self.rotation % 360 != 0 {
+            line.push_str(&format!("  shown turned {}°", self.rotation % 360));
+        }
+        let own = self.overlays.iter().filter(|o| o.area.is_none()).count();
+        let notes = self.overlays.len() - own;
+        if own > 0 {
+            line.push_str("  +drawing");
+        }
+        if notes > 0 {
+            line.push_str(&format!("  +{notes} annotation(s)"));
+        }
+        line
+    }
+
+    fn describe_data(&self) -> String {
         match &self.data {
             PageData::Jpeg { len, .. } => {
                 let (w, h) = self.pixels.unwrap_or((0, 0));

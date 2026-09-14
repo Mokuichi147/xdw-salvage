@@ -9,9 +9,9 @@ use crate::application::ports::{AttachmentScanner, PageDecoder};
 use crate::application::recovery;
 use crate::domain::output::Language as Lang;
 use crate::domain::page::{Page, PageData};
-use crate::domain::rendering::Metafile;
+use crate::domain::rendering::{self, Fill, Image, Metafile, Rect, Segment, Shape, Source};
 use crate::domain::Document;
-use crate::infrastructure::{LzhMetafileDecoder, MagicAttachmentScanner};
+use crate::infrastructure::{png, LzhMetafileDecoder, MagicAttachmentScanner};
 
 /// Settings for [`build`].
 #[derive(Debug, Clone)]
@@ -107,6 +107,21 @@ where
             .decode
             .then(|| recovery::decode_page(data, p, decoder))
             .flatten();
+        // A picture page with a drawing of its own is drawn from that
+        // drawing, which places the picture and whatever sits over it.
+        let overlaid = opts.decode
+            && p.is_recoverable()
+            && p.overlays.iter().any(|o| o.area.is_none())
+            && draw_sheet(p, None, data, doc, decoder, no, &t, &mut body)
+                .map(|(g, d)| {
+                    report.embedded += 1;
+                    report.glyphs += g;
+                    report.pictures += d.saturating_sub(1);
+                })
+                .is_some();
+        if overlaid {
+            continue;
+        }
         match p.data {
             PageData::Jpeg { offset, len } if offset + len <= data.len() => {
                 report.embedded += 1;
@@ -126,9 +141,12 @@ where
             PageData::Encoded { .. } if decoded.is_some() => {
                 let m = decoded.as_ref().expect("decoded guard above");
                 report.embedded += 1;
-                let (placed, drawn) = draw_text(m, data, doc, p.index, no, &t, &mut body);
-                report.glyphs += placed;
-                report.pictures += drawn;
+                if let Some((placed, drawn)) =
+                    draw_sheet(p, Some(m), data, doc, decoder, no, &t, &mut body)
+                {
+                    report.glyphs += placed;
+                    report.pictures += drawn;
+                }
             }
             _ => {
                 if opts.skip_missing {
@@ -252,9 +270,12 @@ header,main,footer{max-width:960px;margin:0 auto}\
 header{padding:28px 0 16px;border-bottom:1px solid var(--line)}\
 h1{margin:0 0 6px;font-size:1.35rem;word-break:break-all}\
 .meta{color:var(--dim);font-size:.85rem;margin:4px 0}\
-.sheet{position:relative;width:100%;background:#fff;overflow:hidden;container-type:size}\
-.sheet .pic{position:absolute;object-fit:fill}\
-.sheet i{position:absolute;display:block}\
+.frame{position:relative;width:100%;overflow:hidden;container-type:size}\
+.sheet{position:absolute;left:0;top:0;width:100%;background:#fff;color:#000;overflow:hidden;container-type:size}\
+.sheet.turn90{width:100cqh;height:100cqw;transform-origin:0 0;transform:translateX(100cqw) rotate(90deg)}\
+.sheet.turn180{transform:rotate(180deg)}\
+.sheet.turn270{width:100cqh;height:100cqw;transform-origin:0 0;transform:translateY(100cqh) rotate(-90deg)}\
+.sheet .art{position:absolute;display:block}\
 .sheet span{position:absolute;white-space:pre;line-height:1;font-family:\"Hiragino Kaku Gothic ProN\",\"Yu Gothic\",\"Meiryo\",\"Noto Sans JP\",sans-serif}\
 .gaps{margin:10px 0 0;font-size:.85rem}\
 .gaps a{display:inline-block;padding:0 4px;color:inherit}\
@@ -432,88 +453,233 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
-/// Lay a metafile's page out as absolutely positioned elements.
-///
-/// The page keeps its real proportions and everything keeps the position the
-/// metafile recorded, so the result reads like the page rather than like a list
-/// of the words on it. Sizes are in units of the sheet, which means the page
-/// stays right at any width.
+/// Where a drawing lands on the sheet, as fractions of the sheet: left,
+/// top, width, height.
+#[derive(Debug, Clone, Copy)]
+struct Place {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl Place {
+    const SHEET: Place = Place {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+}
+
+/// Draw one metafile into a sheet: everything but the text goes into one
+/// SVG element in the metafile's own device units, so pictures, fills, clip
+/// paths and outlines need no conversion; the text goes down as positioned
+/// spans over it, so it stays selectable and searchable.
 ///
 /// Returns the characters placed and the pictures drawn.
 #[allow(clippy::too_many_arguments)]
-fn draw_text(
+fn draw_metafile(
     m: &Metafile,
     data: &[u8],
-    doc: &Document,
-    sheet: usize,
+    stored: &[&Page],
+    place: Place,
+    tag: &str,
     no: usize,
     t: &Text,
-    body: &mut String,
+    svg: &mut String,
+    spans: &mut String,
 ) -> (usize, usize) {
-    let (ux, uy) = m.units_per_point();
-    let (pw, ph) = m.points();
-    if !(ux.is_finite() && uy.is_finite()) || ux <= 0.0 || uy <= 0.0 || pw <= 0.0 || ph <= 0.0 {
+    let (dw, dh) = (m.device.0 as f32, m.device.1 as f32);
+    if dw <= 0.0 || dh <= 0.0 {
         return (0, 0);
     }
-    body.push_str(&format!(
-        "<figure class=\"page\" id=\"p{no}\">\n<div class=\"sheet\" style=\"aspect-ratio:{:.4}\">\n",
-        pw / ph
+    // Pair the stored pictures the page names with the ones beside the sheet.
+    let calls: Vec<(usize, (u32, u32))> = {
+        let mut v: Vec<(usize, (u32, u32))> = m
+            .images
+            .iter()
+            .filter_map(|i| match i.source {
+                Source::Stored { ordinal, px } => Some((ordinal, px)),
+                Source::Inline(_) => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup_by_key(|c| c.0);
+        v
+    };
+    let sizes: Vec<Option<(u32, u32)>> = stored.iter().map(|p| p.pixels).collect();
+    let paired = rendering::pair_pictures(&calls, &sizes);
+    let picture_of = |ordinal: usize| -> Option<&Page> {
+        let at = calls.iter().position(|c| c.0 == ordinal)?;
+        paired.get(at).copied().flatten().map(|k| stored[k])
+    };
+
+    svg.push_str(&format!(
+        "<svg class=\"art\" style=\"left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%\" viewBox=\"0 0 {dw} {dh}\" preserveAspectRatio=\"none\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n",
+        place.x * 100.0,
+        place.y * 100.0,
+        place.w * 100.0,
+        place.h * 100.0
     ));
+    if !m.paths.is_empty() {
+        svg.push_str("<defs>");
+        for (i, path) in m.paths.iter().enumerate() {
+            svg.push_str(&format!(
+                "<clipPath id=\"p{no}{tag}c{i}\"><path d=\"{}\"{}/></clipPath>",
+                path_data(path),
+                if path.even_odd {
+                    " clip-rule=\"evenodd\""
+                } else {
+                    ""
+                }
+            ));
+        }
+        svg.push_str("</defs>\n");
+    }
+    // A clip rectangle becomes an SVG group with a clip path of its own.
+    let mut open_rect: Option<Rect> = None;
+    let mut rect_clips = 0usize;
+    let mut set_rect = |svg: &mut String, want: Option<Rect>, open: &mut Option<Rect>| {
+        if *open == want {
+            return;
+        }
+        if open.is_some() {
+            svg.push_str("</g>\n");
+        }
+        *open = None;
+        if let Some(r) = want {
+            rect_clips += 1;
+            svg.push_str(&format!(
+                "<clipPath id=\"p{no}{tag}r{rect_clips}\"><rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\"/></clipPath><g clip-path=\"url(#p{no}{tag}r{rect_clips})\">\n",
+                r.left,
+                r.top,
+                r.width(),
+                r.height()
+            ));
+            *open = want;
+        }
+    };
+    let clip_attr = |clip_path: Option<usize>| match clip_path {
+        Some(i) => format!(" clip-path=\"url(#p{no}{tag}c{i})\""),
+        None => String::new(),
+    };
 
-    // Pictures go down first: the metafile draws them under everything else.
-    let pictures: Vec<&Page> = doc.pictures_on(sheet).collect();
+    enum Item<'a> {
+        Fill(&'a Fill),
+        Image(&'a Image),
+        Shape(&'a Shape),
+    }
+    let mut items: Vec<(usize, Item)> = Vec::new();
+    items.extend(m.fills.iter().map(|f| (f.order, Item::Fill(f))));
+    items.extend(m.images.iter().map(|i| (i.order, Item::Image(i))));
+    items.extend(m.shapes.iter().map(|s| (s.order, Item::Shape(s))));
+    items.sort_by_key(|(o, _)| *o);
+
     let mut drawn = 0usize;
-    for img in &m.images {
-        let Some(pic) = pictures.iter().find(|p| p.pixels == Some(img.src)) else {
-            continue;
-        };
-        let PageData::Jpeg { offset, len } = pic.data else {
-            continue;
-        };
-        if offset + len > data.len() {
-            continue;
+    let mut pngs: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    for (_, item) in items {
+        match item {
+            Item::Fill(f) => {
+                set_rect(svg, f.clip, &mut open_rect);
+                svg.push_str(&format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{}\"{}/>\n",
+                    f.left,
+                    f.top,
+                    f.right - f.left,
+                    f.bottom - f.top,
+                    hex(f.rgb),
+                    clip_attr(f.clip_path)
+                ));
+            }
+            Item::Image(img) => {
+                let href = match img.source {
+                    Source::Stored { ordinal, .. } => {
+                        let Some(pic) = picture_of(ordinal) else {
+                            continue;
+                        };
+                        let PageData::Jpeg { offset, len } = pic.data else {
+                            continue;
+                        };
+                        if offset + len > data.len() {
+                            continue;
+                        }
+                        format!(
+                            "data:image/jpeg;base64,{}",
+                            b64(&data[offset..offset + len])
+                        )
+                    }
+                    Source::Inline(i) => {
+                        let Some(r) = m.rasters.get(i) else { continue };
+                        pngs.entry(i)
+                            .or_insert_with(|| {
+                                format!("data:image/png;base64,{}", b64(&png::encode(r)))
+                            })
+                            .clone()
+                    }
+                };
+                set_rect(svg, img.clip, &mut open_rect);
+                // A hair of overlap, so bands that abut show no seam.
+                svg.push_str(&format!(
+                    "<image x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" preserveAspectRatio=\"none\"{} xlink:href=\"{href}\"><title>{}</title></image>\n",
+                    img.left,
+                    img.top,
+                    img.width() + 0.5,
+                    img.height() + 0.5,
+                    clip_attr(img.clip_path),
+                    esc(&t.art_alt(no))
+                ));
+                drawn += 1;
+            }
+            Item::Shape(sh) => {
+                set_rect(svg, sh.clip, &mut open_rect);
+                let fill = match sh.fill {
+                    Some(rgb) => hex(rgb),
+                    None => "none".into(),
+                };
+                let stroke = match sh.stroke {
+                    Some((rgb, w)) => {
+                        format!(
+                            " stroke=\"{}\" stroke-width=\"{:.2}\"",
+                            hex(rgb),
+                            w.max(0.5)
+                        )
+                    }
+                    None => String::new(),
+                };
+                svg.push_str(&format!(
+                    "<path d=\"{}\" fill=\"{fill}\"{}{stroke}/>\n",
+                    path_data(&sh.path),
+                    if sh.path.even_odd {
+                        " fill-rule=\"evenodd\""
+                    } else {
+                        ""
+                    }
+                ));
+            }
         }
-        body.push_str(&format!(
-            "<img class=\"pic\" alt=\"{}\" style=\"left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%\" src=\"data:image/jpeg;base64,{}\">\n",
-            esc(&t.art_alt(no)),
-            img.left / ux / pw * 100.0,
-            img.top / uy / ph * 100.0,
-            img.width() / ux / pw * 100.0,
-            img.height() / uy / ph * 100.0,
-            b64(&data[offset..offset + len]),
-        ));
-        drawn += 1;
     }
-
-    // Rules and blocks of colour.
-    for f in &m.fills {
-        if f.clipped {
-            continue;
-        }
-        body.push_str(&format!(
-            "<i style=\"left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%;background:#{:02x}{:02x}{:02x}\"></i>",
-            f.left / ux / pw * 100.0,
-            f.top / uy / ph * 100.0,
-            (f.right - f.left) / ux / pw * 100.0,
-            (f.bottom - f.top) / uy / ph * 100.0,
-            f.rgb.0,
-            f.rgb.1,
-            f.rgb.2
-        ));
-    }
+    set_rect(svg, None, &mut open_rect);
+    svg.push_str("</svg>\n");
 
     let mut placed = 0usize;
     for run in &m.text {
         if run.chars.iter().all(|c| c.is_whitespace()) {
             continue;
         }
-        let size = run.size / uy;
-        let top = (run.y / uy - size) / ph * 100.0;
+        let size = run.size;
+        let top = place.y + (run.y - size) / dh * place.h;
         let (r, g, b) = run.rgb;
         let colour = if (r, g, b) == (0, 0, 0) {
             String::new()
         } else {
             format!("color:#{r:02x}{g:02x}{b:02x};")
+        };
+        let weight = if run.bold { "font-weight:bold;" } else { "" };
+        let line = if run.underline {
+            "text-decoration:underline;"
+        } else {
+            ""
         };
         // Turned text is rotated about its own start, as the metafile means it.
         let turn = if run.escapement != 0 {
@@ -528,24 +694,138 @@ fn draw_text(
             if c.is_whitespace() {
                 continue;
             }
-            let left = run.xs.get(i).copied().unwrap_or(0.0) / ux / pw * 100.0;
+            let left = (place.x + run.xs.get(i).copied().unwrap_or(0.0) / dw * place.w) * 100.0;
+            let top = top * 100.0;
             if !left.is_finite() || !top.is_finite() {
                 continue;
             }
-            body.push_str(&format!(
-                "<span style=\"left:{left:.3}%;top:{top:.3}%;font-size:{:.3}cqh;{colour}{turn}\">{}</span>",
-                size / ph * 100.0,
+            spans.push_str(&format!(
+                "<span style=\"left:{left:.3}%;top:{top:.3}%;font-size:{:.3}cqh;{colour}{weight}{line}{turn}\">{}</span>",
+                size / dh * place.h * 100.0,
                 esc(&c.to_string())
             ));
             placed += 1;
         }
-        body.push('\n');
+        spans.push('\n');
     }
+    (placed, drawn)
+}
+
+fn hex((r, g, b): (u8, u8, u8)) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// An SVG path string for a path in device units.
+fn path_data(p: &rendering::Path) -> String {
+    let mut d = String::new();
+    for f in &p.figures {
+        d.push_str(&format!("M{:.1} {:.1}", f.start.0, f.start.1));
+        for s in &f.segments {
+            match s {
+                Segment::Line((x, y)) => d.push_str(&format!("L{x:.1} {y:.1}")),
+                Segment::Curve(a, b, c) => d.push_str(&format!(
+                    "C{:.1} {:.1} {:.1} {:.1} {:.1} {:.1}",
+                    a.0, a.1, b.0, b.1, c.0, c.1
+                )),
+            }
+        }
+        if f.closed {
+            d.push('Z');
+        }
+    }
+    d
+}
+
+/// One sheet with its drawings and overlays, as a figure.
+///
+/// `main` is the sheet's own metafile, if it expanded. A picture page whose
+/// overlay places its pictures is drawn from the overlay alone.
+#[allow(clippy::too_many_arguments)]
+fn draw_sheet<D: PageDecoder + ?Sized>(
+    p: &Page,
+    main: Option<&Metafile>,
+    data: &[u8],
+    doc: &Document,
+    decoder: &D,
+    no: usize,
+    t: &Text,
+    body: &mut String,
+) -> Option<(usize, usize)> {
+    const PT: f32 = 72.0 / 2540.0;
+    let paper = p.paper.unwrap_or((21000, 29700));
+    let (pw, ph) = (paper.0 as f32 * PT, paper.1 as f32 * PT);
+    let mut svg = String::new();
+    let mut spans = String::new();
+    let (mut glyphs, mut pictures) = (0usize, 0usize);
+    if let Some(m) = main {
+        let stored: Vec<&Page> = doc.pictures_on(p.index).collect();
+        let (g, d) = draw_metafile(
+            m,
+            data,
+            &stored,
+            Place::SHEET,
+            "m",
+            no,
+            t,
+            &mut svg,
+            &mut spans,
+        );
+        glyphs += g;
+        pictures += d;
+    }
+    let mut group: Vec<&Page> = doc.pictures_on(p.index).collect();
+    if p.is_recoverable() {
+        group.push(p);
+        group.sort_by_key(|q| q.index);
+    }
+    for (n, overlay) in p.overlays.iter().enumerate() {
+        let Some(m) = decoder.decode_overlay(overlay, paper) else {
+            continue;
+        };
+        let place = match overlay.area {
+            None => Place::SHEET,
+            Some((x, y, w, h)) => Place {
+                x: x as f32 * PT / pw,
+                y: y as f32 * PT / ph,
+                w: w as f32 * PT / pw,
+                h: h as f32 * PT / ph,
+            },
+        };
+        let stored: &[&Page] = if overlay.area.is_none() { &group } else { &[] };
+        let (g, d) = draw_metafile(
+            &m,
+            data,
+            stored,
+            place,
+            &format!("o{n}"),
+            no,
+            t,
+            &mut svg,
+            &mut spans,
+        );
+        glyphs += g;
+        pictures += d;
+    }
+    if main.is_none() && pictures == 0 {
+        return None;
+    }
+    // The sheet keeps the stored proportions; a page shown turned is turned
+    // by the browser around a wrapper of the shown proportions.
+    let turned = p.rotation % 180 == 90;
+    let (shown_w, shown_h) = if turned { (ph, pw) } else { (pw, ph) };
     body.push_str(&format!(
-        "</div>\n<figcaption>{}</figcaption>\n</figure>\n",
+        "<figure class=\"page\" id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet{}\" style=\"aspect-ratio:{:.4}\">\n{svg}{spans}</div>\n</div>\n<figcaption>{}</figcaption>\n</figure>\n",
+        shown_w / shown_h,
+        match p.rotation % 360 {
+            90 => " turn90",
+            180 => " turn180",
+            270 => " turn270",
+            _ => "",
+        },
+        pw / ph,
         esc(&t.page_label(no))
     ));
-    (placed, drawn)
+    Some((glyphs, pictures))
 }
 
 /// The plain-JPEG artwork that belongs to one sheet, as figures.

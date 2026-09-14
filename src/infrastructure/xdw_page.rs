@@ -40,6 +40,8 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
                 checksum,
                 paper: None,
                 pixels: None,
+                rotation: 0,
+                overlays: Vec::new(),
                 data: PageData::Bare {
                     offset: elem.value,
                     len: elem.len,
@@ -129,6 +131,8 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
             checksum,
             paper,
             pixels,
+            rotation: 0,
+            overlays: Vec::new(),
             data: page_data,
             unknown_fields,
         });
@@ -148,6 +152,8 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
                 checksum,
                 paper: None,
                 pixels: Some((w, h)),
+                rotation: 0,
+                overlays: Vec::new(),
                 data: PageData::Jpeg {
                     offset: body.value + 16,
                     len: body.len - 16,
@@ -167,6 +173,8 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
             checksum,
             paper: None,
             pixels: None,
+            rotation: 0,
+            overlays: Vec::new(),
             data: PageData::Fields {
                 offset: body.value,
                 len: body.len,
@@ -185,6 +193,8 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
         checksum,
         paper: None,
         pixels: None,
+        rotation: 0,
+        overlays: Vec::new(),
         data: PageData::Bare {
             offset: body.value,
             len: body.len,

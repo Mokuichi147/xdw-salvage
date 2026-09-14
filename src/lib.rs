@@ -8,8 +8,12 @@
 //!
 //! * **JPEG pages**, copied out byte for byte,
 //! * **original files** carried inside the document, such as the `.docx` a page
-//!   was printed from, and
-//! * a **PDF** assembled from the above.
+//!   was printed from,
+//! * **printer-driver pages**, expanded from the vendor coding and redrawn
+//!   from the metafile inside: text, pictures, embedded bitmaps, fills and
+//!   outlines, plus the rotation and annotations the document properties add,
+//!   and
+//! * a **PDF** or **HTML** page assembled from the above.
 //!
 //! It also supplies the half of an audit that nothing else can. A bulk
 //! migration through other software cannot mark its own homework; the page
@@ -20,12 +24,10 @@
 //!
 //! # What this does not do
 //!
-//! Pages produced by printing through the vendor's printer driver store their
-//! image in a coding of the vendor's own. This crate does not decode it, and
-//! reports such pages as unrecoverable rather than guessing. In practice that
-//! means office documents converted to `.xdw` often yield their original file
-//! but not their page images, while pages imported from images can come out
-//! whole.
+//! Pages whose coding does not expand, or expand to something that is not a
+//! metafile, are reported as unrecoverable rather than guessed at. Pen styles
+//! such as dashes are drawn solid, and a picture placement that asks for part
+//! of its picture is drawn whole.
 //!
 //! Password-protected and digitally signed documents are refused. They are
 //! written as a later container generation, and no facility to read past access

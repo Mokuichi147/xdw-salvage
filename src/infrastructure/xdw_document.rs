@@ -98,6 +98,26 @@ pub fn parse(data: &[u8]) -> Result<Document> {
         })
         .unwrap_or_default();
 
+    // The properties block says how each page is shown: its paper as
+    // displayed and any rotation. A page element carries neither for a
+    // picture page, and the rotation for no page at all.
+    if let (Some((at, stored)), Some(expanded)) = (properties, expanded) {
+        if let Some(coded) = data.get(at..at + stored) {
+            if let Ok(block) = crate::infrastructure::lzh::decode(coded, expanded as usize) {
+                let shown = crate::infrastructure::xdw_properties::pages(&block);
+                let mut sheets = pages.iter_mut().filter(|p| p.is_sheet());
+                for info in shown {
+                    let Some(sheet) = sheets.next() else { break };
+                    sheet.rotation = info.rotation;
+                    if sheet.paper.is_none() {
+                        sheet.paper = info.paper;
+                    }
+                    sheet.overlays = info.overlays;
+                }
+            }
+        }
+    }
+
     let (generations_present, unknown_tags) = survey(data);
 
     Ok(Document {

@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::domain::attachment::Attachment;
-use crate::domain::page::Page;
+use crate::domain::page::{Overlay, Page};
 use crate::domain::rendering::Metafile;
 use crate::domain::Document;
 use crate::error::Result;
@@ -27,4 +27,11 @@ pub trait AttachmentScanner {
 /// that page's storage format.
 pub trait PageDecoder {
     fn decode(&self, data: &[u8], page: &Page) -> Option<Metafile>;
+
+    /// Recover the drawing laid over a page, when the adapter understands
+    /// its storage format. `paper` is the page's paper in hundredths of a
+    /// millimetre, for overlays that cover the whole page.
+    fn decode_overlay(&self, _overlay: &Overlay, _paper: (u32, u32)) -> Option<Metafile> {
+        None
+    }
 }

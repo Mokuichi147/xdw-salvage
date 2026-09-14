@@ -853,3 +853,12 @@ pub fn decode(bytes: &[u8]) -> Vec<char> {
     }
     out
 }
+
+/// How many bytes `decode` consumed for this character: one for ASCII,
+/// half-width katakana and the replacement character, two otherwise.
+pub fn byte_len(ch: char) -> usize {
+    match ch as u32 {
+        0x00..=0x7F | 0xFF61..=0xFF9F | 0xFFFD => 1,
+        _ => 2,
+    }
+}

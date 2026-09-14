@@ -10,7 +10,8 @@ DocuWorks 形式（`.xdw` / `.xbd`）のコンテナを解析し、ベンダー�
 |---|---|
 | ページ画像 | 回収可能な JPEG を再エンコードせず、バイト単位で取り出す |
 | 同梱された元ファイル | PDF、docx / xlsx / pptx、旧 Office 形式などを切り出す |
-| ページ本文・図版 | ベンダー独自符号化を展開し、対応できる EMF の文字・画像・塗りを復元する |
+| ページ本文・図版 | ベンダー独自符号化を展開し、中の EMF / WMF を再現する。文字、画像配置、埋め込み DIB の帯、罫線・塗り、輪郭パスによるクリップ・塗り・縁取り、太字・下線 |
+| 回転・注釈 | 文書プロパティから表示用紙・回転角を読み、画像ページに重なる図形や注釈（テキスト・矩形）を描く |
 | PDF / HTML | 回収結果を PDF または外部ファイルに依存しない HTML にまとめる |
 | 移行監査 | 構造表示、期待ページ数の算出、変換後のページ数照合、資産分類を行う |
 
@@ -138,7 +139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## 回収範囲と制限
 
 - 写真・図版として格納された JPEG は、元のバイト列を保ったまま回収します。連続する画像帯は、ページ上で扱いやすい単位に連結します。
-- プリンタドライバ由来の版面層は、LHA `-lh5-` を展開して EMF として解釈します。対応する文字、画像配置、塗りは復元しますが、すべての private レコードを再現するものではありません。
+- プリンタドライバ由来の版面層は、LHA `-lh5-` を展開して EMF または WMF として解釈します。文字、JPEG の配置、埋め込み DIB（1/4/8/24 bpp、RLE4/RLE8）、`PATCOPY` の塗り、private のパス（クリップ・塗り・縁取り・ベジェ）を再現します。手元の 7 文書 17 ページは、ベンダー製ソフトの PDF 出力と見た目で一致します。
+- 画像は再エンコードしません。埋め込み DIB は依存なしの zlib 実装で `FlateDecode`（PDF）/ PNG（HTML）に格納します。
+- 対応していないもの：破線などのペンスタイル、`DWc` の部分矩形（行方向以外）、WMF で送り幅を持たない文字列の正確な字送り。
 - 回収できないページは推測で埋めず、`info` や出力レポートで明示します。
 - パスワード保護・電子署名付きの文書は対象外です。アクセス制御を迂回する機能は実装していません。
 - 壊れた入力や未知の形式は、成功またはエラーとして扱い、パニック・無限ループ・過大なメモリ確保を避けます。
@@ -162,4 +165,4 @@ Unlicense。詳細は [`LICENSE`](LICENSE) を参照してください。
 
 ## English summary
 
-`xdw-salvage` reads DocuWorks `.xdw` / `.xbd` containers and salvages data without the vendor's software: JPEG pages byte for byte, embedded source files, and supported printer-driver pages reconstructed from their encoded EMF data. It can write PDF or self-contained HTML and provides commands for inventory and migration checks. Protected and signed documents are refused; no access-control bypass is implemented.
+`xdw-salvage` reads DocuWorks `.xdw` / `.xbd` containers and salvages data without the vendor's software: JPEG pages byte for byte, embedded source files, and printer-driver pages redrawn from the EMF or WMF inside their vendor coding (text, pictures, embedded bitmaps, fills, clip paths and outlines), with page rotation and annotations taken from the document properties. It can write PDF or self-contained HTML and provides commands for inventory and migration checks. Protected and signed documents are refused; no access-control bypass is implemented.

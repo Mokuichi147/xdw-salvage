@@ -2,16 +2,22 @@
 
 pub mod attachments;
 pub mod cp932;
+pub mod deflate;
+pub mod dib;
 pub mod emf;
 pub mod filesystem;
+pub mod gdi;
 pub mod jpeg;
 pub mod lzh;
+pub mod png;
 pub mod recovery;
 pub mod tlv;
 pub mod ttf;
+pub mod wmf;
 pub mod xdw;
 pub mod xdw_document;
 pub mod xdw_page;
+pub mod xdw_properties;
 
 use crate::application::SalvageService;
 

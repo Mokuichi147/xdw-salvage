@@ -16,6 +16,6 @@ pub use attachment::{Attachment, Kind};
 pub use coverage::Coverage;
 pub use document::{Document, Rebuilt, SUPPORTED_GENERATIONS};
 pub use output::Language;
-pub use page::{Page, PageData, Role};
+pub use page::{Overlay, Page, PageData, Role};
 pub use policy::Verdict;
 pub use rendering::{Fill, Image, Metafile, Text};

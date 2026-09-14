@@ -9,7 +9,9 @@ use crate::application::ports::{AttachmentScanner, PageDecoder};
 use crate::application::recovery;
 pub use crate::domain::output::Language as Lang;
 use crate::domain::page::{Page, PageData};
-use crate::domain::rendering::Metafile;
+use crate::domain::rendering::{
+    self, Fill, Image, Metafile, Raster, Rect, Segment, Shape, Source, Text,
+};
 use crate::domain::Document;
 use crate::infrastructure::{jpeg, ttf, LzhMetafileDecoder, MagicAttachmentScanner};
 
@@ -409,6 +411,13 @@ where
 
     for (ordinal, p) in selected.iter().enumerate() {
         let page_no = ordinal + 1;
+        // The page is drawn the way it is stored; the reader turns it the
+        // way the document says it is shown.
+        let rotate = if p.rotation % 360 != 0 {
+            format!(" /Rotate {}", p.rotation % 360)
+        } else {
+            String::new()
+        };
         let decoded = opts
             .decode
             .then(|| recovery::decode_page(data, p, decoder))
@@ -426,6 +435,53 @@ where
                     .or_else(|| info.map(|i| i.points()))
                     .unwrap_or((w_px as f32, h_px as f32));
                 let (pw, ph) = opts.paper.unwrap_or(natural);
+
+                // A picture page may carry a drawing of its own that says
+                // where the picture and its companions go and what is
+                // written over them. When it does, that is the page.
+                let mut content = String::new();
+                let mut xobjects = String::new();
+                let over = if opts.decode && p.overlays.iter().any(|o| o.area.is_none()) {
+                    draw_overlays(
+                        &mut w,
+                        data,
+                        doc,
+                        p,
+                        decoder,
+                        pw,
+                        ph,
+                        &mut content,
+                        &mut xobjects,
+                        opts.font.as_deref(),
+                        &mut used_glyphs,
+                    )
+                } else {
+                    Drawn {
+                        glyphs: 0,
+                        pictures: 0,
+                    }
+                };
+                if over.pictures > 0 {
+                    let fonts = match embedded {
+                        Some(id) => format!("/FJ {id} 0 R"),
+                        None => {
+                            let (latin, cjk) = note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                            font_resources(latin, cjk)
+                        }
+                    };
+                    let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
+                    let pid = w.add(format!(
+                        "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
+                         /Resources << /Font << {fonts} >> /XObject << {xobjects} >> >> \
+                         /Contents {cid} 0 R >>"
+                    ));
+                    kids.push(pid);
+                    report.embedded += 1;
+                    report.glyphs += over.glyphs;
+                    report.pictures_placed += over.pictures.saturating_sub(1);
+                    continue;
+                }
+
                 // Contain-fit, never enlarging: an image smaller than the sheet
                 // keeps its own size rather than being blown up.
                 let scale = (pw / natural.0).min(ph / natural.1).min(1.0);
@@ -472,7 +528,7 @@ where
                 }
                 let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
                 let pid = w.add(format!(
-                    "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}] \
+                    "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
                      /Resources << /XObject << {xobjects} >> >> /Contents {cid} 0 R >>"
                 ));
                 kids.push(pid);
@@ -489,27 +545,34 @@ where
                     .or_else(|| p.paper_points())
                     .unwrap_or(if nw > 1.0 && nh > 1.0 { (nw, nh) } else { A4 });
                 let mut content = String::new();
-                // Pictures first: the metafile draws them under the text.
                 let mut xobjects = String::new();
-                let placed = place_pictures(
+                let stored: Vec<&Page> = doc.pictures_on(p.index).collect();
+                let drawn = draw_page(
+                    &mut w,
+                    data,
+                    &stored,
+                    meta,
+                    Place::sheet(pw, ph),
+                    "M",
+                    &mut content,
+                    &mut xobjects,
+                    opts.font.as_deref(),
+                    &mut used_glyphs,
+                );
+                let over = draw_overlays(
                     &mut w,
                     data,
                     doc,
-                    p.index,
-                    meta,
+                    p,
+                    decoder,
                     pw,
                     ph,
                     &mut content,
                     &mut xobjects,
-                );
-                let glyphs = draw_metafile(
-                    meta,
-                    pw,
-                    ph,
-                    &mut content,
                     opts.font.as_deref(),
                     &mut used_glyphs,
                 );
+                let (glyphs, placed) = (drawn.glyphs + over.glyphs, drawn.pictures + over.pictures);
                 let fonts = match embedded {
                     Some(id) => format!("/FJ {id} 0 R"),
                     None => {
@@ -520,7 +583,7 @@ where
 
                 let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
                 let pid = w.add(format!(
-                    "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}] \
+                    "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
                      /Resources << /Font << {} >>{} >> /Contents {cid} 0 R >>",
                     fonts,
                     if xobjects.is_empty() {
@@ -551,7 +614,7 @@ where
 
                 let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
                 let pid = w.add(format!(
-                    "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}] \
+                    "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
                      /Resources << /Font << {} >>{} >> /Contents {cid} 0 R >>",
                     font_resources(latin, cjk),
                     if xobjects.is_empty() {
@@ -831,102 +894,6 @@ fn width_em(s: &str) -> f32 {
         .sum()
 }
 
-/// Draw a sheet's pictures where the metafile says they go.
-///
-/// The metafile names a picture by the size of the stored image, and the
-/// container stores a sheet's pictures in the order the metafile first calls
-/// for them, so the two line up without guessing. A picture the metafile never
-/// mentions is drawn nowhere rather than invented a place for.
-#[allow(clippy::too_many_arguments)]
-fn place_pictures(
-    w: &mut Writer,
-    data: &[u8],
-    doc: &Document,
-    sheet: usize,
-    meta: &Metafile,
-    pw: f32,
-    ph: f32,
-    content: &mut String,
-    xobjects: &mut String,
-) -> usize {
-    let (ux, uy) = meta.units_per_point();
-    if !(ux.is_finite() && uy.is_finite()) || ux <= 0.0 || uy <= 0.0 || meta.images.is_empty() {
-        return 0;
-    }
-    let (mw, mh) = meta.points();
-    let fit = if mw > 1.0 && mh > 1.0 {
-        (pw / mw).min(ph / mh)
-    } else {
-        1.0
-    };
-
-    // Pair each size the metafile asks for with a stored picture, in order.
-    let pictures: Vec<&Page> = doc.pictures_on(sheet).collect();
-    let mut ids: Vec<(u32, u32, usize)> = Vec::new();
-    let mut taken = vec![false; pictures.len()];
-    for want in meta.image_sizes() {
-        let pick = pictures
-            .iter()
-            .position(|p| {
-                !taken[pictures
-                    .iter()
-                    .position(|q| std::ptr::eq(*q, *p))
-                    .unwrap_or(0)]
-                    && p.pixels == Some(want)
-            })
-            .or_else(|| pictures.iter().position(|p| p.pixels == Some(want)));
-        if let Some(k) = pick {
-            let PageData::Jpeg { offset, len } = pictures[k].data else {
-                continue;
-            };
-            if offset + len > data.len() {
-                continue;
-            }
-            taken[k] = true;
-            let info = jpeg::info(&data[offset..offset + len]);
-            let space = match info.map(|i| i.components).unwrap_or(3) {
-                1 => "/DeviceGray",
-                4 => "/DeviceCMYK",
-                _ => "/DeviceRGB",
-            };
-            let id = w.add_stream(
-                format!(
-                    "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace {space} \
-                     /BitsPerComponent 8 /Filter /DCTDecode >>",
-                    want.0, want.1
-                ),
-                &data[offset..offset + len],
-            );
-            let name = ids.len();
-            xobjects.push_str(&format!("/Pc{name} {id} 0 R "));
-            ids.push((want.0, want.1, name));
-        }
-    }
-
-    let mut drawn = 0usize;
-    for img in &meta.images {
-        let Some(&(_, _, name)) = ids.iter().find(|(a, b, _)| (*a, *b) == img.src) else {
-            continue;
-        };
-        let dw = img.width() / ux * fit;
-        let dh = img.height() / uy * fit;
-        let dx = img.left / ux * fit;
-        // Metafile y grows downward; PDF y grows upward.
-        let dy = ph - img.bottom / uy * fit;
-        if !(dw.is_finite() && dh.is_finite() && dx.is_finite() && dy.is_finite())
-            || dw <= 0.0
-            || dh <= 0.0
-        {
-            continue;
-        }
-        content.push_str(&format!(
-            "q {dw:.2} 0 0 {dh:.2} {dx:.2} {dy:.2} cm /Pc{name} Do Q\n"
-        ));
-        drawn += 1;
-    }
-    drawn
-}
-
 /// Write an embedded CID font and return its object id.
 ///
 /// The font is keyed by glyph index, so the text operand carries glyph indices
@@ -1007,122 +974,517 @@ fn embed_font(w: &mut Writer, id: usize, font: &ttf::Font, used: &BTreeMap<u16, 
     );
 }
 
-/// Draw a page's metafile text onto the sheet, returning how many characters
-/// were placed.
+/// Everything one sheet draws, in the metafile's own order.
+struct Drawn {
+    glyphs: usize,
+    pictures: usize,
+}
+
+/// Turn a page's drawing model into PDF content.
 ///
-/// Every character is positioned individually from the spacing the metafile
-/// recorded, so the line breaks where the original broke it and no font metric
-/// has to be guessed at. Metafile y grows downward and PDF y grows upward, so
-/// each baseline is measured from the top of the sheet.
-fn draw_metafile(
-    meta: &Metafile,
-    pw: f32,
+/// Every primitive goes down in the order the metafile recorded it, so a
+/// white block drawn over a picture still hides it and text still sits on
+/// top of the rule under it. Metafile y grows downward and PDF y grows
+/// upward, so everything is measured from the top of the sheet.
+/// Where on the sheet a drawing goes, in points: its left edge, its top
+/// edge measured down from the top of the sheet, its size, and the sheet
+/// height for turning y the right way up.
+#[derive(Debug, Clone, Copy)]
+struct Place {
+    x: f32,
+    top: f32,
+    w: f32,
+    h: f32,
     ph: f32,
+}
+
+impl Place {
+    fn sheet(pw: f32, ph: f32) -> Self {
+        Place {
+            x: 0.0,
+            top: 0.0,
+            w: pw,
+            h: ph,
+            ph,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_page(
+    w: &mut Writer,
+    data: &[u8],
+    stored: &[&Page],
+    meta: &Metafile,
+    place: Place,
+    tag: &str,
     out: &mut String,
+    xobjects: &mut String,
     font: Option<&ttf::Font>,
     used: &mut BTreeMap<u16, char>,
-) -> usize {
+) -> Drawn {
+    let mut drawn = Drawn {
+        glyphs: 0,
+        pictures: 0,
+    };
     let (ux, uy) = meta.units_per_point();
     if !(ux.is_finite() && uy.is_finite()) || ux <= 0.0 || uy <= 0.0 {
-        return 0;
+        return drawn;
     }
-    // A page whose paper differs from the metafile's own frame is scaled to fit
-    // rather than cropped.
+    // A page whose paper differs from the metafile's own frame is scaled to
+    // fit rather than cropped.
     let (mw, mh) = meta.points();
     let fit = if mw > 1.0 && mh > 1.0 {
-        (pw / mw).min(ph / mh)
+        (place.w / mw).min(place.h / mh)
     } else {
         1.0
     };
-    let mut placed = 0usize;
-    let mut colour: Option<(u8, u8, u8)> = None;
-    // Rules and blocks of colour go down in the metafile's own order, before
-    // the text that sits on them.
-    let mut fill: Option<(u8, u8, u8)> = None;
-    for f in &meta.fills {
-        if f.clipped {
+    let px = |x: f32| place.x + x / ux * fit;
+    let py = |y: f32| (place.ph - place.top) - y / uy * fit;
+
+    // Stored pictures: pair each ordinal the page calls for with a picture
+    // beside the sheet, then embed each picture once.
+    let calls: Vec<(usize, (u32, u32))> = {
+        let mut v: Vec<(usize, (u32, u32))> = meta
+            .images
+            .iter()
+            .filter_map(|i| match i.source {
+                Source::Stored { ordinal, px } => Some((ordinal, px)),
+                Source::Inline(_) => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup_by_key(|c| c.0);
+        v
+    };
+    let sizes: Vec<Option<(u32, u32)>> = stored.iter().map(|p| p.pixels).collect();
+    let paired = rendering::pair_pictures(&calls, &sizes);
+    let mut stored_names: BTreeMap<usize, String> = BTreeMap::new();
+    let mut embedded: BTreeMap<usize, String> = BTreeMap::new();
+    for (&(ordinal, _), pick) in calls.iter().zip(paired.iter()) {
+        let Some(k) = *pick else { continue };
+        if let Some(name) = embedded.get(&k) {
+            stored_names.insert(ordinal, name.clone());
             continue;
         }
-        let (x, y) = (f.left / ux * fit, ph - f.bottom / uy * fit);
-        let (fw, fh) = ((f.right - f.left) / ux * fit, (f.bottom - f.top) / uy * fit);
-        if !(x.is_finite() && y.is_finite() && fw.is_finite() && fh.is_finite())
-            || fw <= 0.0
-            || fh <= 0.0
-        {
+        let PageData::Jpeg { offset, len } = stored[k].data else {
+            continue;
+        };
+        if offset + len > data.len() {
             continue;
         }
-        if fill != Some(f.rgb) {
-            fill = Some(f.rgb);
-            let (r, g, b) = f.rgb;
+        let info = jpeg::info(&data[offset..offset + len]);
+        let (iw, ih) = info
+            .map(|i| (i.width, i.height))
+            .or(stored[k].pixels)
+            .unwrap_or((1, 1));
+        let space = match info.map(|i| i.components).unwrap_or(3) {
+            1 => "/DeviceGray",
+            4 => "/DeviceCMYK",
+            _ => "/DeviceRGB",
+        };
+        let id = w.add_stream(
+            format!(
+                "<< /Type /XObject /Subtype /Image /Width {iw} /Height {ih} /ColorSpace {space} \
+                 /BitsPerComponent 8 /Filter /DCTDecode >>"
+            ),
+            &data[offset..offset + len],
+        );
+        let name = format!("{tag}Pc{k}");
+        xobjects.push_str(&format!("/{name} {id} 0 R "));
+        embedded.insert(k, name.clone());
+        stored_names.insert(ordinal, name);
+    }
+    // Inline bitmaps, each embedded once however often it is placed.
+    let mut raster_names: BTreeMap<usize, String> = BTreeMap::new();
+    for img in &meta.images {
+        let Source::Inline(i) = img.source else {
+            continue;
+        };
+        if raster_names.contains_key(&i) {
+            continue;
+        }
+        let Some(r) = meta.rasters.get(i) else {
+            continue;
+        };
+        let id = raster_object(w, r);
+        let name = format!("{tag}Ra{i}");
+        xobjects.push_str(&format!("/{name} {id} 0 R "));
+        raster_names.insert(i, name);
+    }
+
+    // Merge everything into draw order.
+    enum Item<'a> {
+        Fill(&'a Fill),
+        Image(&'a Image),
+        Shape(&'a Shape),
+        Text(&'a Text),
+    }
+    let mut items: Vec<(usize, Item)> = Vec::new();
+    items.extend(meta.fills.iter().map(|f| (f.order, Item::Fill(f))));
+    items.extend(meta.images.iter().map(|i| (i.order, Item::Image(i))));
+    items.extend(meta.shapes.iter().map(|s| (s.order, Item::Shape(s))));
+    items.extend(meta.text.iter().map(|t| (t.order, Item::Text(t))));
+    items.sort_by_key(|(o, _)| *o);
+
+    // Clipping is expressed with a saved state around a run of primitives
+    // that share the same clip, so a gradient of two hundred slivers inside
+    // one outline emits the outline once.
+    let mut clip_open: Option<(Option<Rect>, Option<usize>)> = None;
+    let mut fill_colour: Option<(u8, u8, u8)> = None;
+    let set_clip = |out: &mut String,
+                    want: (Option<Rect>, Option<usize>),
+                    clip_open: &mut Option<(Option<Rect>, Option<usize>)>,
+                    fill_colour: &mut Option<(u8, u8, u8)>| {
+        if *clip_open == Some(want) {
+            return;
+        }
+        if clip_open.is_some() {
+            out.push_str("Q\n");
+            *fill_colour = None;
+        }
+        *clip_open = None;
+        if want == (None, None) {
+            return;
+        }
+        out.push_str("q\n");
+        if let Some(r) = want.0 {
             out.push_str(&format!(
-                "{:.3} {:.3} {:.3} rg\n",
-                r as f32 / 255.0,
-                g as f32 / 255.0,
-                b as f32 / 255.0
+                "{:.2} {:.2} {:.2} {:.2} re W n\n",
+                px(r.left),
+                py(r.bottom),
+                px(r.right) - px(r.left),
+                py(r.top) - py(r.bottom)
             ));
         }
-        out.push_str(&format!("{x:.2} {y:.2} {fw:.2} {fh:.2} re f\n"));
-    }
-    if fill.is_some() {
-        out.push_str("0 0 0 rg\n");
-    }
-    for t in &meta.text {
-        if colour != Some(t.rgb) {
-            colour = Some(t.rgb);
-            let (r, g, b) = t.rgb;
-            out.push_str(&format!(
-                "{:.3} {:.3} {:.3} rg\n",
-                r as f32 / 255.0,
-                g as f32 / 255.0,
-                b as f32 / 255.0
-            ));
+        if let Some(p) = want.1.and_then(|i| meta.paths.get(i)) {
+            path_ops(p, px, py, out);
+            out.push_str(if p.even_odd { "W* n\n" } else { "W n\n" });
         }
-        let size = (t.size / uy) * fit;
-        if !(size.is_finite() && size > 0.01) {
-            continue;
-        }
-        // Escapement is tenths of a degree, counter-clockwise.
-        let ang = t.escapement as f32 / 10.0 * std::f32::consts::PI / 180.0;
-        let (c, s) = (ang.cos(), ang.sin());
-        let base_y = ph - (t.y / uy) * fit;
-        out.push_str(&format!("BT /FJ {size:.2} Tf\n"));
-        for (i, ch) in t.chars.iter().enumerate() {
-            if *ch == '\u{0}' {
-                continue;
+        *clip_open = Some(want);
+    };
+
+    for (_, item) in items {
+        match item {
+            Item::Fill(f) => {
+                set_clip(out, (f.clip, f.clip_path), &mut clip_open, &mut fill_colour);
+                let (x, y) = (px(f.left), py(f.bottom));
+                let (fw, fh) = (px(f.right) - px(f.left), py(f.top) - py(f.bottom));
+                if !(x.is_finite() && y.is_finite() && fw > 0.0 && fh > 0.0) {
+                    continue;
+                }
+                if fill_colour != Some(f.rgb) {
+                    fill_colour = Some(f.rgb);
+                    out.push_str(&format!("{} rg\n", colour(f.rgb)));
+                }
+                out.push_str(&format!("{x:.2} {y:.2} {fw:.2} {fh:.2} re f\n"));
             }
-            let x = (t.xs.get(i).copied().unwrap_or(0.0) / ux) * fit;
-            if !(x.is_finite() && base_y.is_finite()) {
-                continue;
-            }
-            let mut hex = String::from("<");
-            match font {
-                // With a font of our own, the operand is a glyph index.
-                Some(f) => match f.glyph(*ch) {
-                    Some(gid) => {
-                        used.insert(gid, *ch);
-                        hex.push_str(&format!("{gid:04X}"));
-                    }
-                    None => continue,
-                },
-                // Otherwise the reader's own Japanese face maps UTF-16 directly.
-                None => {
-                    let mut buf = [0u16; 2];
-                    for unit in ch.encode_utf16(&mut buf) {
-                        hex.push_str(&format!("{unit:04X}"));
+            Item::Image(img) => {
+                let name = match img.source {
+                    Source::Stored { ordinal, .. } => stored_names.get(&ordinal),
+                    Source::Inline(i) => raster_names.get(&i),
+                };
+                let Some(name) = name else { continue };
+                set_clip(
+                    out,
+                    (img.clip, img.clip_path),
+                    &mut clip_open,
+                    &mut fill_colour,
+                );
+                let dw = px(img.right) - px(img.left);
+                let dh = py(img.top) - py(img.bottom);
+                let (dx, dy) = (px(img.left), py(img.bottom));
+                if !(dw.is_finite() && dh.is_finite() && dx.is_finite() && dy.is_finite())
+                    || dw <= 0.0
+                    || dh <= 0.0
+                {
+                    continue;
+                }
+                let stencil = match img.source {
+                    Source::Inline(i) => meta.rasters.get(i).and_then(|r| r.stencil),
+                    Source::Stored { .. } => None,
+                };
+                if let Some(rgb) = stencil {
+                    if fill_colour != Some(rgb) {
+                        fill_colour = Some(rgb);
+                        out.push_str(&format!("{} rg\n", colour(rgb)));
                     }
                 }
+                out.push_str(&format!(
+                    "q {dw:.2} 0 0 {dh:.2} {dx:.2} {dy:.2} cm /{name} Do Q\n"
+                ));
+                drawn.pictures += 1;
             }
-            hex.push('>');
-            out.push_str(&format!(
-                "{c:.5} {s:.5} {:.5} {c:.5} {x:.2} {base_y:.2} Tm {hex} Tj\n",
-                -s
-            ));
-            placed += 1;
+            Item::Shape(s) => {
+                set_clip(out, (s.clip, None), &mut clip_open, &mut fill_colour);
+                if s.path.is_empty() {
+                    continue;
+                }
+                if let Some(rgb) = s.fill {
+                    if fill_colour != Some(rgb) {
+                        fill_colour = Some(rgb);
+                        out.push_str(&format!("{} rg\n", colour(rgb)));
+                    }
+                }
+                if let Some((rgb, width)) = s.stroke {
+                    out.push_str(&format!(
+                        "{} RG {:.2} w\n",
+                        colour(rgb),
+                        (width / uy * fit).max(0.2)
+                    ));
+                }
+                path_ops(&s.path, px, py, out);
+                out.push_str(
+                    match (s.fill.is_some(), s.stroke.is_some(), s.path.even_odd) {
+                        (true, true, true) => "B*\n",
+                        (true, true, false) => "B\n",
+                        (true, false, true) => "f*\n",
+                        (true, false, false) => "f\n",
+                        (false, true, _) => "S\n",
+                        (false, false, _) => "n\n",
+                    },
+                );
+            }
+            Item::Text(t) => {
+                set_clip(out, (None, None), &mut clip_open, &mut fill_colour);
+                drawn.glyphs += draw_text(t, px, py, uy, fit, out, font, used, &mut fill_colour);
+            }
         }
-        out.push_str("ET\n");
     }
-    if colour.is_some() {
-        out.push_str("0 0 0 rg\n");
+    if clip_open.is_some() {
+        out.push_str("Q\n");
+    }
+    out.push_str("0 0 0 rg\n");
+    drawn
+}
+
+/// Draw the overlays a page carries: its own drawing over the whole sheet
+/// and any annotations in their boxes.
+#[allow(clippy::too_many_arguments)]
+fn draw_overlays<D: PageDecoder + ?Sized>(
+    w: &mut Writer,
+    data: &[u8],
+    doc: &Document,
+    p: &Page,
+    decoder: &D,
+    pw: f32,
+    ph: f32,
+    out: &mut String,
+    xobjects: &mut String,
+    font: Option<&ttf::Font>,
+    used: &mut BTreeMap<u16, char>,
+) -> Drawn {
+    const PT: f32 = 72.0 / 2540.0;
+    let mut total = Drawn {
+        glyphs: 0,
+        pictures: 0,
+    };
+    let paper = p.paper.unwrap_or((21000, 29700));
+    // A page overlay names every picture of the page in storage order, the
+    // sheet's own included when the sheet is itself a picture.
+    let mut group: Vec<&Page> = doc.pictures_on(p.index).collect();
+    if p.is_recoverable() {
+        group.push(p);
+        group.sort_by_key(|q| q.index);
+    }
+    for (n, overlay) in p.overlays.iter().enumerate() {
+        let Some(meta) = decoder.decode_overlay(overlay, paper) else {
+            continue;
+        };
+        let place = match overlay.area {
+            None => Place::sheet(pw, ph),
+            Some((x, y, aw, ah)) => Place {
+                x: x as f32 * PT,
+                top: y as f32 * PT,
+                w: aw as f32 * PT,
+                h: ah as f32 * PT,
+                ph,
+            },
+        };
+        let stored: &[&Page] = if overlay.area.is_none() { &group } else { &[] };
+        let d = draw_page(
+            w,
+            data,
+            stored,
+            &meta,
+            place,
+            &format!("O{n}"),
+            out,
+            xobjects,
+            font,
+            used,
+        );
+        total.glyphs += d.glyphs;
+        total.pictures += d.pictures;
+    }
+    total
+}
+
+fn colour((r, g, b): (u8, u8, u8)) -> String {
+    format!(
+        "{:.3} {:.3} {:.3}",
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0
+    )
+}
+
+/// Path construction operators for a path, without the painting operator.
+fn path_ops(
+    p: &rendering::Path,
+    px: impl Fn(f32) -> f32,
+    py: impl Fn(f32) -> f32,
+    out: &mut String,
+) {
+    for f in &p.figures {
+        out.push_str(&format!("{:.2} {:.2} m\n", px(f.start.0), py(f.start.1)));
+        for s in &f.segments {
+            match s {
+                Segment::Line((x, y)) => out.push_str(&format!("{:.2} {:.2} l\n", px(*x), py(*y))),
+                Segment::Curve(a, b, c) => out.push_str(&format!(
+                    "{:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c\n",
+                    px(a.0),
+                    py(a.1),
+                    px(b.0),
+                    py(b.1),
+                    px(c.0),
+                    py(c.1)
+                )),
+            }
+        }
+        if f.closed {
+            out.push_str("h\n");
+        }
+    }
+}
+
+/// An image object for a bitmap carried inside the page.
+fn raster_object(w: &mut Writer, r: &Raster) -> usize {
+    let body = crate::infrastructure::deflate::zlib(&r.rows);
+    if r.stencil.is_some() {
+        // A stencil paints the fill colour through its zero bits.
+        return w.add_stream(
+            format!(
+                "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ImageMask true \
+                 /BitsPerComponent 1 /Decode [0 1] /Filter /FlateDecode >>",
+                r.width, r.height
+            ),
+            &body,
+        );
+    }
+    let space = if r.bits == 24 {
+        "/DeviceRGB".to_string()
+    } else if r.is_bilevel() {
+        // Black and white goes straight to a one-bit grey image; a palette
+        // starting with white needs the decode array turned round.
+        if r.palette[0] == (255, 255, 255) {
+            "/DeviceGray /Decode [1 0]".to_string()
+        } else {
+            "/DeviceGray".to_string()
+        }
+    } else {
+        let mut hex = String::with_capacity(r.palette.len() * 6);
+        for (cr, cg, cb) in &r.palette {
+            hex.push_str(&format!("{cr:02X}{cg:02X}{cb:02X}"));
+        }
+        format!(
+            "[/Indexed /DeviceRGB {} <{hex}>]",
+            r.palette.len().saturating_sub(1)
+        )
+    };
+    let bpc = if r.bits == 24 { 8 } else { r.bits };
+    w.add_stream(
+        format!(
+            "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace {space} \
+             /BitsPerComponent {bpc} /Filter /FlateDecode >>",
+            r.width, r.height
+        ),
+        &body,
+    )
+}
+
+/// One run of text, each character positioned from the spacing the
+/// metafile recorded, so the line breaks where the original broke it and
+/// no font metric has to be guessed at.
+#[allow(clippy::too_many_arguments)]
+fn draw_text(
+    t: &Text,
+    px: impl Fn(f32) -> f32,
+    py: impl Fn(f32) -> f32,
+    uy: f32,
+    fit: f32,
+    out: &mut String,
+    font: Option<&ttf::Font>,
+    used: &mut BTreeMap<u16, char>,
+    fill_colour: &mut Option<(u8, u8, u8)>,
+) -> usize {
+    let size = (t.size / uy) * fit;
+    if !(size.is_finite() && size > 0.01) {
+        return 0;
+    }
+    if *fill_colour != Some(t.rgb) {
+        *fill_colour = Some(t.rgb);
+        out.push_str(&format!("{} rg\n", colour(t.rgb)));
+    }
+    // Escapement is tenths of a degree, counter-clockwise.
+    let ang = t.escapement as f32 / 10.0 * std::f32::consts::PI / 180.0;
+    let (c, s) = (ang.cos(), ang.sin());
+    let base_y = py(t.y);
+    out.push_str(&format!("BT /FJ {size:.2} Tf\n"));
+    if t.bold {
+        // Bold without a bold face: stroke the outline a little.
+        out.push_str(&format!("2 Tr {} RG {:.2} w\n", colour(t.rgb), size * 0.03));
+    }
+    let mut placed = 0usize;
+    let mut last_x: Option<f32> = None;
+    for (i, ch) in t.chars.iter().enumerate() {
+        if *ch == '\u{0}' {
+            continue;
+        }
+        let x = px(t.xs.get(i).copied().unwrap_or(0.0));
+        if !(x.is_finite() && base_y.is_finite()) {
+            continue;
+        }
+        let mut hex = String::from("<");
+        match font {
+            // With a font of our own, the operand is a glyph index.
+            Some(f) => match f.glyph(*ch) {
+                Some(gid) => {
+                    used.insert(gid, *ch);
+                    hex.push_str(&format!("{gid:04X}"));
+                }
+                None => continue,
+            },
+            // Otherwise the reader's own Japanese face maps UTF-16 directly.
+            None => {
+                let mut buf = [0u16; 2];
+                for unit in ch.encode_utf16(&mut buf) {
+                    hex.push_str(&format!("{unit:04X}"));
+                }
+            }
+        }
+        hex.push('>');
+        out.push_str(&format!(
+            "{c:.5} {s:.5} {:.5} {c:.5} {x:.2} {base_y:.2} Tm {hex} Tj\n",
+            -s
+        ));
+        last_x = Some(x + size * if (*ch as u32) < 0x100 { 0.55 } else { 1.0 });
+        placed += 1;
+    }
+    if t.bold {
+        out.push_str("0 Tr\n");
+    }
+    out.push_str("ET\n");
+    if t.underline && t.escapement == 0 {
+        if let (Some(first), Some(last)) = (t.xs.first(), last_x) {
+            let y = base_y - size * 0.12;
+            out.push_str(&format!(
+                "{} RG {:.2} w {:.2} {y:.2} m {last:.2} {y:.2} l S\n",
+                colour(t.rgb),
+                (size * 0.06).max(0.2),
+                px(*first)
+            ));
+        }
     }
     placed
 }
