@@ -1,6 +1,6 @@
 # xdw-salvage
 
-DocuWorks 形式（`.xdw` / `.xbd`）のコンテナを解析し、ベンダー製品なしで回収できるデータを取り出す Rust クレート／CLI です。依存クレートはなく、`unsafe` も使用していません。
+DocuWorks 形式（`.xdw` / `.xbd`）のコンテナを解析し、ベンダー製品なしで回収できるデータを取り出す Rust クレート／CLI です。文字コード変換に `encoding_rs` を使用し、`unsafe` は使用していません。
 
 > **非公式ツールです。** FUJIFILM Business Innovation とは無関係で、同社の承認・支援・提携を受けていません。DocuWorks は同社の製品名です。
 
@@ -36,6 +36,8 @@ adapters（PDF / HTML / CLI）
 ## インストール
 
 ソースから CLI をインストールします。
+
+Rust 1.88 以降が必要です。
 
 ```sh
 cargo install --path .
@@ -161,7 +163,7 @@ cargo doc --no-deps
 
 実ファイルの観察と、公開されているインターフェース仕様の意味論をもとに独自実装しています。ベンダーのコード、ヘッダ、バイナリ、文書は含めず、アクセス制御の迂回も行いません。テスト用のサンプル文書も同梱していません。
 
-Unlicense。詳細は [`LICENSE`](LICENSE) を参照してください。
+コード本体は Unlicense です。CP932 のデコードに使用する `encoding_rs` のライセンス情報は [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) にまとめています。詳細は [`LICENSE`](LICENSE) も参照してください。
 
 ## English summary
 

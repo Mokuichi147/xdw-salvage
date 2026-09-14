@@ -2,7 +2,7 @@
 name = "xdw-salvage"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.88"
 license = "Unlicense"
 description = "Reads the container structure of DocuWorks (.xdw) files and salvages what can be recovered losslessly: JPEG pages, embedded original files, and a PDF assembled from them. Independent clean-room implementation, not affiliated with or endorsed by FUJIFILM Business Innovation."
 readme = "README.md"
@@ -11,6 +11,7 @@ categories = ["parser-implementations", "command-line-utilities"]
 exclude = ["/samples"]
 
 [dependencies]
+encoding_rs = "=0.8.41"
 
 [lib]
 name = "xdw_salvage"

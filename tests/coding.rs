@@ -263,6 +263,11 @@ fn page_text_decodes_from_the_windows_japanese_code_page() {
         cp932::decode(&[0xb1, 0xb2]).iter().collect::<String>(),
         "ｱｲ"
     );
+    assert_eq!(
+        cp932::decode(&[0x80]).iter().collect::<String>(),
+        "\u{0080}"
+    );
+    assert_eq!(cp932::byte_len('\u{0080}'), 1);
 }
 
 #[test]
