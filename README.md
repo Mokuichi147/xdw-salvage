@@ -2,7 +2,7 @@
 
 DocuWorks 形式（`.xdw` / `.xbd`）のコンテナを解析し、ベンダー製品なしで回収できるデータを取り出す Rust クレート／CLI です。文字コード変換に `encoding_rs` を使用し、`unsafe` は使用していません。
 
-> **非公式ツールです。** FUJIFILM Business Innovation とは無関係で、同社の承認・支援・提携を受けていません。DocuWorks は同社の製品名です。
+> **非公式ツールです。** FUJIFILM Business Innovation とは無関係で、同社の承認・支援・提携を受けていません。DocuWorks は富士フイルムビジネスイノベーション株式会社の登録商標または商標です。
 
 ## できること
 
@@ -168,3 +168,5 @@ cargo doc --no-deps
 ## English summary
 
 `xdw-salvage` reads DocuWorks `.xdw` / `.xbd` containers and salvages data without the vendor's software: JPEG pages byte for byte, embedded source files, and printer-driver pages redrawn from the EMF or WMF inside their vendor coding (text, pictures, embedded bitmaps, fills, clip paths and outlines), with page rotation and annotations taken from the document properties. It can write PDF or self-contained HTML and provides commands for inventory and migration checks. Protected and signed documents are refused; no access-control bypass is implemented.
+
+DocuWorks is a registered trademark or trademark of FUJIFILM Business Innovation Corp. `xdw-salvage` is an unofficial project and is not affiliated with, approved, supported, or endorsed by FUJIFILM Business Innovation Corp.
