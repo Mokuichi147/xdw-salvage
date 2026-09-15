@@ -61,6 +61,26 @@ fn jpeg_page(w: u32, h: u32) -> Vec<u8> {
     elem(0x64, &page)
 }
 
+/// A kind-5 page whose nested data field contains a JPEG directly.
+fn kind5_jpeg_page(w: u32, h: u32) -> Vec<u8> {
+    let stream = tiny_jpeg(w as u16, h as u16);
+    let mut body = Vec::new();
+    body.extend_from_slice(&elem(0x80, &[5]));
+    body.extend_from_slice(&elem(0x84, &21000u16.to_be_bytes()));
+    body.extend_from_slice(&elem(0x85, &29700u16.to_be_bytes()));
+    // These attributes belong to the kind-5 page form. Their values are not
+    // needed to recover the JPEG, but they must not be reported as unknown
+    // fields once this page form is recognized.
+    for tag in [0x87, 0x88, 0x8B, 0x8C] {
+        body.extend_from_slice(&elem(tag, &[0]));
+    }
+    body.extend_from_slice(&elem(0x8D, &[3]));
+    body.extend_from_slice(&elem(0x86, &stream));
+    let mut page = elem(0x81, &[0x01, 0x02, 0x03, 0x04]);
+    page.extend_from_slice(&elem(0x82, &body));
+    elem(0x64, &page)
+}
+
 /// A page whose body is nested metadata around opaque image data.
 fn encoded_page(payload_len: usize) -> Vec<u8> {
     let mut body = Vec::new();
@@ -213,6 +233,30 @@ fn reads_pages_through_the_trailer() {
     assert!(!doc.pages[1].is_recoverable());
     assert_eq!(doc.pages[1].paper, Some((21000, 29700)));
     assert_eq!(doc.pages[1].pixels, Some((4961, 7016)));
+}
+
+#[test]
+fn nested_kind5_jpeg_is_recoverable() {
+    let original = tiny_jpeg(600, 800);
+    let file = container(10, 0x68, vec![kind5_jpeg_page(600, 800)], &[]);
+    let doc = parse(&file).expect("parses");
+
+    assert!(doc.pages[0].is_recoverable());
+    assert_eq!(doc.pages[0].paper, Some((21000, 29700)));
+    assert_eq!(doc.pages[0].pixels, Some((600, 800)));
+    assert!(doc.pages[0].unknown_fields.is_empty());
+    let PageData::Jpeg { offset, len } = &doc.pages[0].data else {
+        panic!("kind 5 JPEG was not classified as a JPEG page");
+    };
+    assert_eq!(&file[*offset..*offset + *len], original.as_slice());
+
+    let (bytes, report) = pdf::build(&file, &doc, pdf::Options::default());
+    assert_eq!(report.embedded, 1);
+    assert_eq!(report.placeholders, 0);
+    assert!(String::from_utf8_lossy(&bytes).contains("/DCTDecode"));
+    assert!(bytes
+        .windows(original.len())
+        .any(|w| w == original.as_slice()));
 }
 
 #[test]

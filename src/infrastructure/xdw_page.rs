@@ -2,7 +2,8 @@
 
 use crate::domain::page::{Page, PageData, Role};
 use crate::error::Result;
-use crate::infrastructure::tlv::{self, Tlv};
+use crate::infrastructure::tlv::Tlv;
+use crate::infrastructure::{jpeg, tlv};
 
 // ページ要素内のフィールドタグ。
 const F_CHECKSUM: u8 = 0x81;
@@ -19,9 +20,24 @@ const B_METHOD: u8 = 0x8A;
 const B_COLOUR: u8 = 0x8D;
 const B_PIXEL_W: u8 = 0x90;
 const B_PIXEL_H: u8 = 0x91;
+const B_JPEG_WIDTH: u8 = 0x87;
+const B_JPEG_HEIGHT: u8 = 0x88;
+const B_JPEG_X_RESOLUTION: u8 = 0x8B;
+const B_JPEG_Y_RESOLUTION: u8 = 0x8C;
 
 // プレビュー画像で確認されている本体種別コード。
 const KIND_PREVIEW: u64 = 7;
+// ネストされた kind 5 のJPEGページ。
+const KIND_JPEG: u64 = 5;
+
+// kind 5 のJPEGページに付随する補助属性。値の意味はこの判定には不要で、
+// 既知のページ属性として扱える。
+const KIND_JPEG_EXTRA_FIELDS: &[u8] = &[
+    B_JPEG_WIDTH,
+    B_JPEG_HEIGHT,
+    B_JPEG_X_RESOLUTION,
+    B_JPEG_Y_RESOLUTION,
+];
 
 /// `offset` のタグから始まるページ要素を読み取る。
 pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
@@ -57,21 +73,23 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
     // 形状1: kindフィールドから始まるネストされた本体。
     if raw.first() == Some(&B_KIND) && tlv::window_is_nested(data, body.value, body.len) {
         let f = tlv::read_window(data, body.value, body.len)?;
-        unknown_fields.extend(unknown(
-            &f,
-            &[
-                B_KIND,
-                B_AUX,
-                B_PAPER_W,
-                B_PAPER_H,
-                B_DATA,
-                B_STORED_LEN,
-                B_METHOD,
-                B_COLOUR,
-                B_PIXEL_W,
-                B_PIXEL_H,
-            ],
-        ));
+        let kind_code = tlv::find_uint(&f, data, B_KIND).unwrap_or(0);
+        let mut known_fields = vec![
+            B_KIND,
+            B_AUX,
+            B_PAPER_W,
+            B_PAPER_H,
+            B_DATA,
+            B_STORED_LEN,
+            B_METHOD,
+            B_COLOUR,
+            B_PIXEL_W,
+            B_PIXEL_H,
+        ];
+        if kind_code == KIND_JPEG {
+            known_fields.extend_from_slice(KIND_JPEG_EXTRA_FIELDS);
+        }
+        unknown_fields.extend(unknown(&f, &known_fields));
         let paper = match (
             tlv::find_uint(&f, data, B_PAPER_W),
             tlv::find_uint(&f, data, B_PAPER_H),
@@ -86,7 +104,16 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
             (Some(w), Some(h)) => Some((w as u32, h as u32)),
             _ => None,
         };
-        let kind_code = tlv::find_uint(&f, data, B_KIND).unwrap_or(0);
+        if kind_code == KIND_JPEG {
+            if let (Some(w), Some(h)) = (
+                tlv::find_uint(&f, data, B_JPEG_WIDTH),
+                tlv::find_uint(&f, data, B_JPEG_HEIGHT),
+            ) {
+                if let (Ok(w), Ok(h)) = (u32::try_from(w), u32::try_from(h)) {
+                    pixels = Some((w, h));
+                }
+            }
+        }
         let aux_len = tlv::find_uint(&f, data, B_AUX);
         let img = tlv::find(&f, B_DATA);
 
@@ -108,6 +135,15 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
                     stored,
                     expanded,
                     rows,
+                }
+            }
+            (KIND_JPEG, Some(img)) if img.bytes(data).starts_with(&[0xFF, 0xD8]) => {
+                if let Some(info) = jpeg::info(img.bytes(data)) {
+                    pixels = Some((info.width, info.height));
+                }
+                PageData::Jpeg {
+                    offset: img.value,
+                    len: img.len,
                 }
             }
             (_, Some(img)) => PageData::Encoded {

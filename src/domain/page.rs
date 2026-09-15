@@ -6,7 +6,8 @@ const KNOWN_COMPRESSION: u64 = 1;
 /// ページデータの保存形態。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PageData {
-    /// 16オクテットのヘッダーに続くJPEGストリーム。バイト単位で復元できる。
+    /// ページ要素のヘッダーまたはkind 5のネスト本体に続くJPEGストリーム。
+    /// バイト単位で復元できる。
     Jpeg { offset: usize, len: usize },
     /// DIBヘッダーとパレットが平文で、その後に独自圧縮された画素データが続くプレビュー画像。
     Preview {
