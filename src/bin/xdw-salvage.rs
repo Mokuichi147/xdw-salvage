@@ -248,7 +248,7 @@ fn run_info(files: &[String]) -> ExitCode {
             cov.pictures,
             cov.thumbnails,
             if cov.data_tables > 0 {
-                format!(" + {} data table", cov.data_tables)
+                format!(" + {} data entry", cov.data_tables)
             } else {
                 String::new()
             },

@@ -13,7 +13,7 @@ pub struct Coverage {
     pub pictures_recovered: usize,
     /// Thumbnail entries, which are not content.
     pub thumbnails: usize,
-    /// Entries that are tables of named data in the clear, not pages at all.
+    /// ページではないデータエントリ。
     pub data_tables: usize,
     /// Sheets that carry at least one recoverable picture.
     pub sheets_with_pictures: usize,

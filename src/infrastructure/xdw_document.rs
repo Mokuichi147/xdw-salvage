@@ -246,15 +246,17 @@ fn scan_for_pages(data: &[u8]) -> Vec<usize> {
 /// サムネイルを区切りとして、ページテーブル内エントリの役割を確定する。
 fn assign_roles(pages: &mut [Page]) {
     let mut group: Vec<usize> = Vec::new();
+    let mut after_thumbnail = false;
     for i in 0..pages.len() {
         if matches!(pages[i].data, PageData::Fields { .. }) {
             pages[i].role = Role::Data;
             pages[i].belongs_to = None;
+            after_thumbnail = false;
             continue;
         }
         if matches!(pages[i].data, PageData::Preview { .. }) {
             pages[i].role = Role::Thumbnail;
-            close_group(pages, &group);
+            close_group(pages, &group, false);
             let owner = group
                 .iter()
                 .rev()
@@ -262,15 +264,16 @@ fn assign_roles(pages: &mut [Page]) {
                 .map(|&k| pages[k].index);
             pages[i].belongs_to = owner;
             group.clear();
+            after_thumbnail = true;
         } else {
             group.push(i);
         }
     }
-    close_group(pages, &group);
+    close_group(pages, &group, after_thumbnail);
 }
 
 /// サムネイル間にある一続きのエントリの役割を確定する。
-fn close_group(pages: &mut [Page], group: &[usize]) {
+fn close_group(pages: &mut [Page], group: &[usize], after_thumbnail: bool) {
     if group.is_empty() {
         return;
     }
@@ -282,6 +285,23 @@ fn close_group(pages: &mut [Page], group: &[usize]) {
         .collect();
     let group = &group[..];
     if group.is_empty() {
+        return;
+    }
+    // 用紙・画素のどちらの形状情報もないBareエントリは、復元対象ページでは
+    // なくコンテナ内の不透明データである。特にプレビュー後の末尾エントリは
+    // 埋め込み文書やアプリケーション状態を持つことがあり、ページテーブルに
+    // 列挙されているだけで余分な本文ページにしてはならない。
+    let opaque_data = after_thumbnail
+        && group.iter().all(|&i| {
+            matches!(pages[i].data, PageData::Bare { .. })
+                && pages[i].paper.is_none()
+                && pages[i].pixels.is_none()
+        });
+    if opaque_data {
+        for &i in group {
+            pages[i].role = Role::Data;
+            pages[i].belongs_to = None;
+        }
         return;
     }
     // コンテナは本文とその上の画像を順に書く。本文より前の画像は、本文に

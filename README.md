@@ -15,7 +15,7 @@ DocuWorks 形式（`.xdw` / `.xbd`）のコンテナを解析し、ベンダー�
 | PDF / HTML | 回収結果を PDF または外部ファイルに依存しない HTML にまとめる |
 | 移行監査 | 構造表示、期待ページ数の算出、変換後のページ数照合、資産分類を行う |
 
-ページ表にはシートだけでなく、縮小画像やページ上の画像も含まれます。本ツールはこれらを区別し、縮小画像を実ページとして二重に数えないようにします。詳しい解析結果と実測値は [`docs/coding.md`](docs/coding.md) を参照してください。
+ページ表にはシートだけでなく、縮小画像やページ上の画像も含まれます。本ツールはこれらを区別し、縮小画像を実ページとして二重に数えないようにします。実装上の判断は [`docs/coding.md`](docs/coding.md) を参照してください。
 
 ## アーキテクチャ
 
@@ -95,9 +95,9 @@ xdw-salvage verify   <FILE.xdw> --pages <N> 変換後のページ数を照合す
 変換後の PDF を本クレート自身に再解析させるのではなく、コンテナから得られる期待値と外部ツールの結果を比較します。
 
 ```sh
-xdw-salvage manifest 稟議書.xdw
-converted_pages="$(pdfinfo 稟議書.pdf | awk '/^Pages/{print $2}')"
-xdw-salvage verify 稟議書.xdw --pages "$converted_pages"
+xdw-salvage manifest input.xdw
+converted_pages="$(pdfinfo output.pdf | awk '/^Pages/{print $2}')"
+xdw-salvage verify input.xdw --pages "$converted_pages"
 ```
 
 ページ数が一致しない場合、`verify` は終了コード 1 を返します。大量の入力を調べる場合は `triage`、個別の未復号ストリームを保存する場合は `codec` を使用してください。
@@ -111,7 +111,7 @@ use xdw_salvage::{adapters::pdf, infrastructure};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = infrastructure::local_service();
-    let asset = service.open(Path::new("scan.xdw"))?;
+    let asset = service.open(Path::new("input.xdw"))?;
     let analysis = service.analyze(&asset);
 
     println!(
@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &asset.document,
         pdf::Options::default(),
     );
-    std::fs::write("scan.pdf", pdf_bytes)?;
+    std::fs::write("output.pdf", pdf_bytes)?;
     println!("{} ページを PDF に埋め込み", report.embedded);
     Ok(())
 }
@@ -162,7 +162,7 @@ cargo doc --no-deps
 
 ## 由来とライセンス
 
-実ファイルの観察と、公開されているインターフェース仕様の意味論をもとに独自実装しています。ベンダーのコード、ヘッダ、バイナリ、文書は含めず、アクセス制御の迂回も行いません。テスト用のサンプル文書も同梱していません。
+公開されているインターフェース仕様の意味論をもとに独自実装しています。ベンダーのコード、ヘッダ、バイナリは含めず、アクセス制御の迂回も行いません。
 
 コード本体は Unlicense です。CP932 のデコードに使用する `encoding_rs` のライセンス情報は [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) にまとめています。詳細は [`LICENSE`](LICENSE) も参照してください。
 

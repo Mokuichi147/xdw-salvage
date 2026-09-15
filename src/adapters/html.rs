@@ -516,7 +516,7 @@ fn b64(data: &[u8]) -> String {
 
 /// Whether a sheet is small enough to plausibly be a text label attached to a
 /// preceding image page.  It uses only the page geometry, never a document
-/// name or a sample-specific value.
+/// name or a caller-provided value.
 fn is_text_only_label(page: &Page) -> bool {
     let Some((w, h)) = page.paper else {
         return false;
@@ -600,6 +600,7 @@ fn draw_metafile(
     if dw <= 0.0 || dh <= 0.0 {
         return (0, 0);
     }
+    let upright_vertical = m.uses_upright_vertical_text();
     // Pair the stored pictures the page names with the ones beside the sheet.
     let calls: Vec<(usize, (u32, u32))> = {
         let mut v: Vec<(usize, (u32, u32))> = m
@@ -774,7 +775,12 @@ fn draw_metafile(
             continue;
         }
         let size = run.size;
-        let top = place.y + (run.y - size) / dh * place.h;
+        let text_y = if upright_vertical {
+            run.y + size * 0.8
+        } else {
+            run.y
+        };
+        let top = place.y + (text_y - size) / dh * place.h;
         let (r, g, b) = run.rgb;
         let colour = if (r, g, b) == (0, 0, 0) {
             String::new()
@@ -788,7 +794,7 @@ fn draw_metafile(
             ""
         };
         // Turned text is rotated about its own start, as the metafile means it.
-        let turn = if run.escapement != 0 {
+        let turn = if run.escapement != 0 && !upright_vertical {
             format!(
                 "transform:rotate({:.1}deg);transform-origin:0 100%;",
                 -(run.escapement as f32) / 10.0
@@ -1002,11 +1008,7 @@ mod tests {
             None
         }
 
-        fn decode_overlay(
-            &self,
-            _overlay: &Overlay,
-            _paper: (u32, u32),
-        ) -> Option<Metafile> {
+        fn decode_overlay(&self, _overlay: &Overlay, _paper: (u32, u32)) -> Option<Metafile> {
             Some(Metafile {
                 device: (100, 100),
                 frame_mm100: (21000, 29700),

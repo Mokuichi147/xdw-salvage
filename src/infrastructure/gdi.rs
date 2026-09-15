@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use crate::domain::rendering::{
-    Figure, Fill, Image, Metafile, Path, Raster, Rect, Segment, Shape, Source, Text,
+    Figure, Fill, Image, Metafile, Path, Raster, RasterOp, Rect, Segment, Shape, Source, Text,
 };
 use crate::infrastructure::dib;
 
@@ -399,30 +399,26 @@ impl Canvas {
             raster.stencil = Some(colour);
         } else if rop == SRCAND {
             // The source is a monochrome mask: a zero bit clears the
-            // destination and a one bit leaves it alone.  An image mask with
-            // black as its painted colour has exactly that effect on the
-            // white paper used by the PDF and HTML adapters.
+            // destination and a one bit leaves it alone.  Normalize the
+            // bitmap so bit zero is the foreground that needs to be retained
+            // by the output adapters.
             if raster.bits != 1 {
                 return false;
             }
-            if raster.palette.get(1) == Some(&(0, 0, 0)) {
-                for byte in &mut raster.rows {
-                    *byte = !*byte;
-                }
-            }
-            raster.stencil = Some((0, 0, 0));
+            normalize_and_mask(&mut raster);
         } else if rop != SRCCOPY {
             return false;
         }
         crop(&mut raster, src);
+        let raster_op = RasterOp::from_code(rop);
         let index = self.page.rasters.len();
         self.page.rasters.push(raster);
-        self.place(Source::Inline(index), dst);
+        self.place(Source::Inline(index), dst, raster_op);
         true
     }
 
     /// Place a picture at a logical rectangle given as x, y, width, height.
-    fn place(&mut self, source: Source, (x, y, w, h): (i32, i32, i32, i32)) {
+    fn place(&mut self, source: Source, (x, y, w, h): (i32, i32, i32, i32), raster_op: RasterOp) {
         let order = self.advance();
         let (l, t) = self.device(x, y);
         let (r, b) = self.device(x.saturating_add(w), y.saturating_add(h));
@@ -448,6 +444,7 @@ impl Canvas {
             bottom: b,
             src: px,
             source,
+            raster_op,
             order,
             clip: self.clip,
             clip_path: self.clip_path,
@@ -623,7 +620,10 @@ impl Canvas {
         else {
             return false;
         };
-        self.place_current((x, y, w, h), (sw, sh))
+        let raster_op = u32_at(body, 48)
+            .map(RasterOp::from_code)
+            .unwrap_or(RasterOp::Copy);
+        self.place_current((x, y, w, h), (sw, sh), raster_op)
     }
 
     /// The 16-bit flavour of `DWc`: logical rectangle, source rectangle and
@@ -634,7 +634,7 @@ impl Canvas {
             let Some((l, t, r, b)) = self.clip_logical else {
                 return false;
             };
-            return self.place_current((l, t, r - l, b - t), (0, 0));
+            return self.place_current((l, t, r - l, b - t), (0, 0), RasterOp::Copy);
         }
         let f = |i: usize| i16_at(body, 4 + i * 2).map(i32::from);
         let (Some(x), Some(y), Some(w), Some(h), Some(sw), Some(sh)) =
@@ -642,14 +642,30 @@ impl Canvas {
         else {
             return false;
         };
-        self.place_current((x, y, w, h), (sw, sh))
+        self.place_current((x, y, w, h), (sw, sh), RasterOp::Copy)
     }
 
     /// Draw the current picture at `dst`; `(sw, sh)` is its stored size when
     /// the placement says, or zero when only the order identifies it.
-    fn place_current(&mut self, dst: (i32, i32, i32, i32), (sw, sh): (i32, i32)) -> bool {
+    fn place_current(
+        &mut self,
+        dst: (i32, i32, i32, i32),
+        (sw, sh): (i32, i32),
+        raster_op: RasterOp,
+    ) -> bool {
         if sw < 0 || sh < 0 || dst.2 <= 0 || dst.3 <= 0 {
             return false;
+        }
+        if raster_op == RasterOp::And {
+            if let Some(Source::Inline(index)) = self.picture {
+                let Some(raster) = self.page.rasters.get_mut(index) else {
+                    return false;
+                };
+                if raster.bits != 1 {
+                    return false;
+                }
+                normalize_and_mask(raster);
+            }
         }
         let source = match self.picture {
             Some(Source::Stored { ordinal, .. }) => Source::Stored {
@@ -668,13 +684,14 @@ impl Canvas {
             }
         };
         self.picture = Some(source);
-        self.place(source, dst);
+        self.place(source, dst, raster_op);
         true
     }
 
     /// Geometry comments: a point list in one of three codings, either added
-    /// to the path under construction or, for the filled polygon, painted
-    /// straight away.
+    /// to the current path figure or, for the filled polygon, painted straight
+    /// away.  The private `POLYLINE` and `POLYLINE_TO` records continue the
+    /// current figure; `LINE` starts a new one.
     fn geometry(&mut self, body: &[u8]) -> bool {
         let (op, code) = (body[2], body[3]);
         if !matches!(code, dw::CODE_I16 | dw::CODE_I8 | dw::CODE_NIBBLE) {
@@ -705,32 +722,33 @@ impl Canvas {
                 self.paint(path, true, true, order);
                 true
             }
-            dw::OP_POLYLINE | dw::OP_LINE | dw::OP_POLYLINE_TO => {
+            dw::OP_POLYLINE | dw::OP_POLYLINE_TO => {
                 let Some(path) = self.path.as_mut() else {
                     return false;
                 };
-                match path.figures.last_mut() {
-                    Some(f) => {
-                        // These records continue the current figure.  The
-                        // first record after a begin-path starts it; keeping
-                        // subsequent records in the same figure is important
-                        // for outlines made from several straight segments.
-                        if f.segments.is_empty() && f.start == pts[0] {
-                            f.segments
-                                .extend(pts[1..].iter().map(|p| Segment::Line(*p)));
-                        } else {
-                            f.segments.extend(pts.iter().map(|p| Segment::Line(*p)));
-                        }
-                    }
-                    None => {
-                        if let Some((first, rest)) = pts.split_first() {
-                            path.figures.push(Figure {
-                                start: *first,
-                                segments: rest.iter().map(|p| Segment::Line(*p)).collect(),
-                                closed: false,
-                            });
-                        }
-                    }
+                if let Some(figure) = path.figures.last_mut() {
+                    figure
+                        .segments
+                        .extend(pts.iter().map(|p| Segment::Line(*p)));
+                } else if let Some((first, rest)) = pts.split_first() {
+                    path.figures.push(Figure {
+                        start: *first,
+                        segments: rest.iter().map(|p| Segment::Line(*p)).collect(),
+                        closed: false,
+                    });
+                }
+                true
+            }
+            dw::OP_LINE => {
+                let Some(path) = self.path.as_mut() else {
+                    return false;
+                };
+                if let Some((first, rest)) = pts.split_first() {
+                    path.figures.push(Figure {
+                        start: *first,
+                        segments: rest.iter().map(|p| Segment::Line(*p)).collect(),
+                        closed: false,
+                    });
                 }
                 true
             }
@@ -811,6 +829,19 @@ impl Canvas {
     }
 }
 
+/// Normalize a monochrome SRCAND bitmap to the common foreground-bit form.
+fn normalize_and_mask(raster: &mut Raster) {
+    if raster.stencil.is_some() {
+        return;
+    }
+    if raster.palette.get(1) == Some(&(0, 0, 0)) {
+        for byte in &mut raster.rows {
+            *byte = !*byte;
+        }
+    }
+    raster.stencil = Some((0, 0, 0));
+}
+
 /// Keep only the `src` part (x, y, width, height) of a raster.
 ///
 /// Only whole rows are cut; a horizontal crop would mean re-packing every
@@ -865,32 +896,62 @@ pub fn decode_points(body: &[u8]) -> Option<Vec<(i32, i32)>> {
             }
         }
         dw::CODE_NIBBLE => {
-            let escaped = |at: &mut usize, nibble: i32| -> Option<i32> {
-                if nibble != -8 {
-                    return Some(nibble);
-                }
-                let b = *body.get(*at)? as i8;
-                *at += 1;
-                if b != i8::MIN {
-                    return Some(i32::from(b));
-                }
-                let v = i16_at(body, *at)?;
-                *at += 2;
-                Some(i32::from(v))
-            };
-            for _ in 1..n {
-                let b = *body.get(at)?;
-                at += 1;
-                let hi = i32::from(((b >> 4) as i8) << 4 >> 4);
-                let lo = i32::from(((b & 0x0F) as i8) << 4 >> 4);
-                x += escaped(&mut at, hi)?;
-                y += escaped(&mut at, lo)?;
-                pts.push((x, y));
+            let payload = body.get(12..)?;
+            let (decoded, consumed) = decode_nibbles(payload, n, (x, y), false)?;
+            if consumed == payload.len() {
+                return Some(decoded);
             }
+            let (decoded, consumed) = decode_nibbles(payload, n, (x, y), true)?;
+            if consumed != payload.len() {
+                return None;
+            }
+            return Some(decoded);
         }
         _ => return None,
     }
     Some(pts)
+}
+
+/// Decode the compact point payload.  A `-8` nibble introduces a signed
+/// byte; some writers additionally use `-128` as a marker for a following
+/// 16-bit value.  The byte form is tried first because it is unambiguous when
+/// it consumes the complete record, while the wider form remains available
+/// for records whose declared length requires it.
+fn decode_nibbles(
+    payload: &[u8],
+    n: usize,
+    first: (i32, i32),
+    extend_i16: bool,
+) -> Option<(Vec<(i32, i32)>, usize)> {
+    let mut x = first.0;
+    let mut y = first.1;
+    let mut pts = Vec::with_capacity(n);
+    pts.push((x, y));
+    let mut at = 0usize;
+    let escaped = |at: &mut usize, nibble: i32| -> Option<i32> {
+        if nibble != -8 {
+            return Some(nibble);
+        }
+        let b = *payload.get(*at)? as i8;
+        *at += 1;
+        if extend_i16 && b == i8::MIN {
+            let v = i16_at(payload, *at)?;
+            *at += 2;
+            Some(i32::from(v))
+        } else {
+            Some(i32::from(b))
+        }
+    };
+    for _ in 1..n {
+        let b = *payload.get(at)?;
+        at += 1;
+        let hi = i32::from(((b >> 4) as i8) << 4 >> 4);
+        let lo = i32::from(((b & 0x0F) as i8) << 4 >> 4);
+        x += escaped(&mut at, hi)?;
+        y += escaped(&mut at, lo)?;
+        pts.push((x, y));
+    }
+    Some((pts, at))
 }
 
 pub fn u32_at(d: &[u8], at: usize) -> Option<u32> {
@@ -950,6 +1011,12 @@ mod tests {
             decode_points(&b),
             Some(vec![(100, 100), (97, 101), (55, 103), (60, 1103)])
         );
+    }
+
+    #[test]
+    fn nibble_points_keep_a_signed_128_escape_in_the_byte_form() {
+        let b = geometry(0x02, 0x80, 3, (0, 0), &[0x08, 0x80, 0x11]);
+        assert_eq!(decode_points(&b), Some(vec![(0, 0), (0, -128), (1, -127)]));
     }
 
     #[test]
@@ -1017,6 +1084,7 @@ mod tests {
         );
         let i = c.page.images[0];
         assert_eq!((i.left, i.top, i.right, i.bottom), (10.0, 10.0, 30.0, 20.0));
+        assert_eq!(i.raster_op, RasterOp::Copy);
     }
 
     #[test]
@@ -1051,6 +1119,30 @@ mod tests {
         });
         c.pat_fill(0, 0, 10, 10);
         assert_eq!(c.page.fills[3].clip_path, None);
+    }
+
+    #[test]
+    fn a_polyline_continues_the_current_private_path_figure() {
+        let mut c = Canvas::new((100, 100), (1000, 1000));
+        c.select(STOCK | NULL_BRUSH);
+        let first = geometry(dw::OP_LINE, dw::CODE_I16, 2, (10, 20), &[30, 0, 40, 0]);
+        let continuation = geometry(dw::OP_POLYLINE, dw::CODE_I16, 2, (50, 60), &[70, 0, 80, 0]);
+
+        assert!(c.comment(dw::BEGIN_PATH));
+        assert!(c.comment(&first));
+        assert!(c.comment(&continuation));
+        assert!(c.comment(dw::STROKE_PATH));
+
+        assert_eq!(c.page.shapes.len(), 1);
+        assert_eq!(c.page.shapes[0].path.figures.len(), 1);
+        assert_eq!(
+            c.page.shapes[0].path.figures[0].segments,
+            vec![
+                Segment::Line((30.0, 40.0)),
+                Segment::Line((50.0, 60.0)),
+                Segment::Line((70.0, 80.0)),
+            ]
+        );
     }
 
     #[test]
@@ -1182,6 +1274,7 @@ mod tests {
         assert!(c.stretch_dib(&info, &[0x80, 0, 0, 0], (0, 0, 1, 1), (0, 0, 1, 1), SRCAND));
         assert_eq!(c.page.rasters[0].stencil, Some((0, 0, 0)));
         assert_eq!(c.page.rasters[0].rows, vec![0x7f]);
+        assert_eq!(c.page.images[0].raster_op, RasterOp::And);
     }
 
     #[test]
@@ -1212,5 +1305,6 @@ mod tests {
         assert_eq!(c.page.rasters.len(), 1);
         assert_eq!(c.page.images[0].source, Source::Inline(0));
         assert_eq!(c.page.images[0].src, (1, 1));
+        assert_eq!(c.page.images[0].raster_op, RasterOp::Copy);
     }
 }

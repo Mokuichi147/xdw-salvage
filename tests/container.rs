@@ -1,7 +1,6 @@
 //! Tests run against containers built inside the test itself.
 //!
-//! No sample document is shipped with this crate. Everything here is synthetic,
-//! so the suite carries no third-party file.
+//! Everything here is synthetic, so the suite carries no third-party file.
 
 use xdw_salvage::adapters::pdf;
 use xdw_salvage::application::verification as verify;
@@ -94,6 +93,13 @@ fn encoded_page(payload_len: usize) -> Vec<u8> {
     body.extend_from_slice(&elem(0x86, &vec![0x5A; payload_len]));
     let mut page = elem(0x81, &[0x01, 0x02, 0x03, 0x04]);
     page.extend_from_slice(&elem(0x82, &body));
+    elem(0x64, &page)
+}
+
+/// 表示形状を持たない不透明データのページ型エントリ。
+fn bare_page() -> Vec<u8> {
+    let mut page = elem(0x81, &[0x09, 0x08, 0x07, 0x06]);
+    page.extend_from_slice(&elem(0x82, &[0x99; 32]));
     elem(0x64, &page)
 }
 
@@ -630,10 +636,8 @@ fn a_sheets_artwork_lands_on_that_sheet_not_on_sheets_of_its_own() {
 
 #[test]
 fn artwork_on_a_recovered_sheet_is_kept_not_dropped() {
-    // One real cover is an aerial photograph with a panel of samples over it.
-    // The sheet itself came out as a plain JPEG, and an earlier version threw
-    // the photograph away because it only salvaged artwork off sheets that
-    // could *not* be recovered. Nothing recovered may be dropped.
+    // A recovered sheet can still own artwork. Keep both layers and preserve
+    // their recorded order; nothing recovered may be dropped.
     let file = container(
         10,
         0x68,
@@ -644,7 +648,7 @@ fn artwork_on_a_recovered_sheet_is_kept_not_dropped() {
     let (bytes, report) = pdf::build(&file, &doc, pdf::Options::default());
     assert_eq!(report.embedded, 1, "the sheet itself");
     assert_eq!(report.placeholders, 0);
-    assert_eq!(report.pictures_placed, 1, "the photograph was dropped");
+    assert_eq!(report.pictures_placed, 1, "the artwork was dropped");
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("/Count 1"), "the cover became several pages");
     assert!(text.contains("/Im0"), "the sheet is missing");
@@ -833,7 +837,7 @@ fn the_pdf_records_what_it_carries() {
     let file = container(10, 0x68, vec![jpeg_page(600, 800), encoded_page(64)], &[]);
     let doc = parse(&file).expect("parses");
     let opts = pdf::Options {
-        title: Some("稟議書.xdw".into()),
+        title: Some("title.xdw".into()),
         ..pdf::Options::default()
     };
     let (bytes, _) = pdf::build(&file, &doc, opts);
@@ -1090,7 +1094,7 @@ fn the_source_document_can_travel_inside_the_pdf() {
     let bytes = container(10, 0x68, vec![encoded_page(64), encoded_page(64)], &[]);
     let opts = pdf::Options {
         carry_source: true,
-        title: Some("稟議書 2026.xdw".into()),
+        title: Some("source.xdw".into()),
         ..pdf::Options::default()
     };
     let (out, report) = pdf::build(&bytes, &parse(&bytes).unwrap(), opts);
@@ -1114,13 +1118,13 @@ fn the_source_document_can_travel_inside_the_pdf() {
 fn a_japanese_title_survives_into_the_document_information() {
     let bytes = container(10, 0x68, vec![encoded_page(64)], &[]);
     let opts = pdf::Options {
-        title: Some("稟議書 2026".into()),
+        title: Some("日本語タイトル".into()),
         ..pdf::Options::default()
     };
     let (out, _) = pdf::build(&bytes, &parse(&bytes).unwrap(), opts);
     let text = String::from_utf8_lossy(&out);
     // UTF-16BE with the byte order mark, not a row of question marks.
-    let want: String = "稟議書 2026"
+    let want: String = "日本語タイトル"
         .encode_utf16()
         .map(|u| format!("{u:04X}"))
         .collect();
@@ -1137,7 +1141,7 @@ fn the_source_document_can_travel_inside_the_html() {
     let doc = parse(&bytes).unwrap();
     let opts = xdw_salvage::adapters::html::Options {
         carry_source: true,
-        title: Some("plan.xdw".into()),
+        title: Some("source.xdw".into()),
         ..xdw_salvage::adapters::html::Options::default()
     };
     let (page, report) = xdw_salvage::adapters::html::build(&bytes, &doc, &opts);
@@ -1394,6 +1398,25 @@ fn a_table_of_names_in_the_clear_is_not_a_page() {
     );
 
     // It does not become a page of the conversion either.
+    let (bytes, _) = pdf::build(&file, &doc, pdf::Options::default());
+    assert!(String::from_utf8_lossy(&bytes).contains("/Count 1"));
+}
+
+#[test]
+fn metadata_less_bare_tail_is_not_a_page() {
+    let file = container(
+        10,
+        0x68,
+        vec![encoded_page(64), preview_page(), bare_page()],
+        &[],
+    );
+    let doc = parse(&file).expect("parses");
+    let cov = doc.coverage();
+    assert_eq!(cov.sheets, 1, "不透明な末尾データがページとして数えられた");
+    assert_eq!(cov.thumbnails, 1);
+    assert_eq!(cov.data_tables, 1);
+    assert_eq!(doc.pages[2].role.as_str(), "data");
+
     let (bytes, _) = pdf::build(&file, &doc, pdf::Options::default());
     assert!(String::from_utf8_lossy(&bytes).contains("/Count 1"));
 }

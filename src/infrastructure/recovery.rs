@@ -2,7 +2,7 @@
 
 use crate::application::ports::PageDecoder;
 use crate::domain::page::{Overlay, Page, PageData};
-use crate::domain::rendering::{Image, Metafile, Source};
+use crate::domain::rendering::{Image, Metafile, RasterOp, Source};
 use crate::infrastructure::{dib, emf, lzh, wmf};
 
 const KIND_BITMAP: u64 = 7;
@@ -79,6 +79,7 @@ fn bitmap_overlay(overlay: &Overlay, paper: (u32, u32)) -> Option<Metafile> {
         bottom: height as f32,
         src: (width, height),
         source: Source::Inline(0),
+        raster_op: RasterOp::Copy,
         order: 1,
         clip: None,
         clip_path: None,

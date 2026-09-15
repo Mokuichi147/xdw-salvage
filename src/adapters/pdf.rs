@@ -10,7 +10,7 @@ use crate::application::recovery;
 pub use crate::domain::output::Language as Lang;
 use crate::domain::page::{Page, PageData};
 use crate::domain::rendering::{
-    self, Fill, Image, Metafile, Raster, Rect, Segment, Shape, Source, Text,
+    self, Fill, Image, Metafile, Raster, RasterOp, Rect, Segment, Shape, Source, Text,
 };
 use crate::domain::Document;
 use crate::infrastructure::{deflate, jpeg, ttf, LzhMetafileDecoder, MagicAttachmentScanner};
@@ -125,7 +125,7 @@ fn margin_of(pw: f32, ph: f32) -> f32 {
 /// Whether a sheet is small enough to plausibly be a text label attached to a
 /// preceding image page.  The decision is based only on the page's declared
 /// geometry and drawing contents; it does not depend on a document name or on
-/// the text carried by a particular sample.
+/// the text carried by the page.
 fn is_text_only_label(page: &Page) -> bool {
     let Some((w, h)) = page.paper else {
         return false;
@@ -595,9 +595,8 @@ where
                     stream,
                 );
                 // A sheet that is itself a picture can still have pictures of
-                // its own sitting on it: one real cover is an aerial photograph
-                // with a panel of samples over it. Dropping them because the
-                // sheet came out would be throwing away recovered content, so
+                // its own sitting on it. Dropping them because the sheet came
+                // out would be throwing away recovered content, so
                 // the sheet takes the upper part of the page and they follow.
                 let runs = doc.picture_runs(p.index);
                 let mut xobjects = format!("/Im0 {img} 0 R ");
@@ -1273,6 +1272,7 @@ fn draw_page(
     } else {
         1.0
     };
+    let upright_vertical = meta.uses_upright_vertical_text();
     let px = |x: f32| place.x + x / ux * fit;
     let py = |y: f32| (place.ph - place.top) - y / uy * fit;
 
@@ -1294,9 +1294,11 @@ fn draw_page(
     let sizes: Vec<Option<(u32, u32)>> = stored.iter().map(|p| p.pixels).collect();
     let paired = rendering::pair_pictures(&calls, &sizes);
     let mut stored_names: BTreeMap<usize, String> = BTreeMap::new();
+    let mut stored_indices: BTreeMap<usize, usize> = BTreeMap::new();
     let mut embedded: BTreeMap<usize, String> = BTreeMap::new();
     for (&(ordinal, _), pick) in calls.iter().zip(paired.iter()) {
         let Some(k) = *pick else { continue };
+        stored_indices.insert(ordinal, k);
         if let Some(name) = embedded.get(&k) {
             stored_names.insert(ordinal, name.clone());
             continue;
@@ -1347,16 +1349,87 @@ fn draw_page(
         raster_names.insert(i, name);
     }
 
+    // A few metafiles implement a transparent picture with the GDI sequence
+    // SRCINVERT -> SRCAND mask -> SRCINVERT.  It is one picture operation,
+    // although it appears as three image records in the metafile.  Recognise
+    // that operation from its raster operations and matching geometry, then
+    // express it as a PDF soft mask.  This keeps the source order intact and
+    // does not make text orientation decide the z-order.
+    let mut masked_names: BTreeMap<usize, String> = BTreeMap::new();
+    let mut masked_parts = vec![false; meta.images.len()];
+    for middle in 1..meta.images.len().saturating_sub(1) {
+        let before_index = middle - 1;
+        let after_index = middle + 1;
+        if masked_parts[before_index] || masked_parts[middle] || masked_parts[after_index] {
+            continue;
+        }
+        let before = &meta.images[before_index];
+        let mask = &meta.images[middle];
+        let after = &meta.images[after_index];
+        let (
+            Source::Stored {
+                ordinal: before_ordinal,
+                ..
+            },
+            Source::Inline(mask_index),
+            Source::Stored {
+                ordinal: after_ordinal,
+                ..
+            },
+        ) = (before.source, mask.source, after.source)
+        else {
+            continue;
+        };
+        if before.raster_op != RasterOp::SourceInvert
+            || after.raster_op != RasterOp::SourceInvert
+            || mask.raster_op != RasterOp::And
+            || before.src != after.src
+            || mask.order != before.order.saturating_add(1)
+            || after.order != mask.order.saturating_add(1)
+            || !same_image_placement(before, mask)
+            || !same_image_placement(before, after)
+            || stored_indices.get(&before_ordinal) != stored_indices.get(&after_ordinal)
+        {
+            continue;
+        }
+        let Some(raster) = meta.rasters.get(mask_index) else {
+            continue;
+        };
+        let Some(&stored_index) = stored_indices.get(&before_ordinal) else {
+            continue;
+        };
+        let Some(name) = masked_jpeg_name(
+            w,
+            data,
+            stored.get(stored_index).copied(),
+            raster,
+            before.src,
+            tag,
+            before_index,
+            xobjects,
+        ) else {
+            continue;
+        };
+        masked_names.insert(before_index, name);
+        masked_parts[middle] = true;
+        masked_parts[after_index] = true;
+    }
+
     // Merge everything into draw order.
     enum Item<'a> {
         Fill(&'a Fill),
-        Image(&'a Image),
+        Image(usize, &'a Image),
         Shape(&'a Shape),
         Text(&'a Text),
     }
     let mut items: Vec<(usize, Item)> = Vec::new();
     items.extend(meta.fills.iter().map(|f| (f.order, Item::Fill(f))));
-    items.extend(meta.images.iter().map(|i| (i.order, Item::Image(i))));
+    items.extend(
+        meta.images
+            .iter()
+            .enumerate()
+            .map(|(index, i)| (i.order, Item::Image(index, i))),
+    );
     items.extend(meta.shapes.iter().map(|s| (s.order, Item::Shape(s))));
     items.extend(meta.text.iter().map(|t| (t.order, Item::Text(t))));
     items.sort_by_key(|(o, _)| *o);
@@ -1414,11 +1487,14 @@ fn draw_page(
                 }
                 out.push_str(&format!("{x:.2} {y:.2} {fw:.2} {fh:.2} re f\n"));
             }
-            Item::Image(img) => {
-                let name = match img.source {
+            Item::Image(index, img) => {
+                if masked_parts[index] {
+                    continue;
+                }
+                let name = masked_names.get(&index).or_else(|| match img.source {
                     Source::Stored { ordinal, .. } => stored_names.get(&ordinal),
                     Source::Inline(i) => raster_names.get(&i),
-                };
+                });
                 let Some(name) = name else { continue };
                 set_clip(
                     out,
@@ -1490,6 +1566,7 @@ fn draw_page(
                     py,
                     uy,
                     fit,
+                    upright_vertical,
                     out,
                     font,
                     used,
@@ -1594,6 +1671,95 @@ fn colour((r, g, b): (u8, u8, u8)) -> String {
     )
 }
 
+fn same_image_placement(a: &Image, b: &Image) -> bool {
+    let close = |left: f32, right: f32| (left - right).abs() <= 0.01;
+    close(a.left, b.left)
+        && close(a.top, b.top)
+        && close(a.right, b.right)
+        && close(a.bottom, b.bottom)
+        && a.clip == b.clip
+        && a.clip_path == b.clip_path
+}
+
+/// Embed one JPEG with a grayscale soft mask derived from a one-bit bitmap.
+///
+/// The metafile mask is often at device resolution while the JPEG is half that
+/// size. Sampling in the mask's coordinate system lets the PDF image and its
+/// mask use the same dimensions, as required by PDF readers.
+#[allow(clippy::too_many_arguments)]
+fn masked_jpeg_name(
+    w: &mut Writer,
+    data: &[u8],
+    page: Option<&Page>,
+    mask: &Raster,
+    source_size: (u32, u32),
+    tag: &str,
+    image_index: usize,
+    xobjects: &mut String,
+) -> Option<String> {
+    let page = page?;
+    let PageData::Jpeg { offset, len } = page.data else {
+        return None;
+    };
+    let stream = data.get(offset..offset.checked_add(len)?)?;
+    let info = jpeg::info(stream);
+    let (width, height) = info
+        .map(|i| (i.width, i.height))
+        .or_else(|| (source_size.0 > 0 && source_size.1 > 0).then_some(source_size))?;
+    let alpha = mask_alpha(mask, width, height)?;
+    let alpha_body = deflate::zlib(&alpha);
+    let mask_id = w.add_stream(
+        format!(
+            "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} \
+             /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode >>"
+        ),
+        &alpha_body,
+    );
+    let space = match info.map(|i| i.components).unwrap_or(3) {
+        1 => "/DeviceGray",
+        4 => "/DeviceCMYK",
+        _ => "/DeviceRGB",
+    };
+    let image_id = w.add_stream(
+        format!(
+            "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} \
+             /ColorSpace {space} /BitsPerComponent 8 /Filter /DCTDecode \
+             /SMask {mask_id} 0 R >>"
+        ),
+        stream,
+    );
+    let name = format!("{tag}Pm{image_index}");
+    xobjects.push_str(&format!("/{name} {image_id} 0 R "));
+    Some(name)
+}
+
+/// Convert the source-and mask's foreground (zero) bits into white alpha.
+fn mask_alpha(mask: &Raster, width: u32, height: u32) -> Option<Vec<u8>> {
+    if mask.bits != 1 || mask.width == 0 || mask.height == 0 || width == 0 || height == 0 {
+        return None;
+    }
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    let pixels = width.checked_mul(height)?;
+    let stride = mask.stride();
+    if mask.rows.len() < stride.checked_mul(mask.height as usize)? {
+        return None;
+    }
+    let mut alpha = vec![0u8; pixels];
+    for y in 0..height {
+        let source_y = (((y as u64 * 2 + 1) * u64::from(mask.height)) / (2 * height as u64))
+            .min(u64::from(mask.height - 1)) as usize;
+        let row = &mask.rows[source_y * stride..(source_y + 1) * stride];
+        for x in 0..width {
+            let source_x = (((x as u64 * 2 + 1) * u64::from(mask.width)) / (2 * width as u64))
+                .min(u64::from(mask.width - 1)) as usize;
+            let bit = (row[source_x / 8] >> (7 - source_x % 8)) & 1;
+            alpha[y * width + x] = if bit == 0 { 255 } else { 0 };
+        }
+    }
+    Some(alpha)
+}
+
 /// Path construction operators for a path, without the painting operator.
 fn path_ops(
     p: &rendering::Path,
@@ -1631,7 +1797,7 @@ fn raster_object(w: &mut Writer, r: &Raster) -> usize {
         return w.add_stream(
             format!(
                 "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ImageMask true \
-                 /BitsPerComponent 1 /Decode [0 1] /Filter /FlateDecode >>",
+                 /BitsPerComponent 1 /Decode [1 0] /Filter /FlateDecode >>",
                 r.width, r.height
             ),
             &body,
@@ -1678,6 +1844,7 @@ fn draw_text(
     py: impl Fn(f32) -> f32,
     uy: f32,
     fit: f32,
+    upright_vertical: bool,
     out: &mut String,
     font: Option<&ttf::Font>,
     used: &mut BTreeMap<u16, char>,
@@ -1693,10 +1860,23 @@ fn draw_text(
         *fill_colour = Some(t.rgb);
         out.push_str(&format!("{} rg\n", colour(t.rgb)));
     }
-    // Escapement is tenths of a degree, counter-clockwise.
-    let ang = t.escapement as f32 / 10.0 * std::f32::consts::PI / 180.0;
+    // エスケープメントは反時計回りの10分の1度単位。縦書きでは各字の
+    // 縦位置が既に記録されているため、直角回転は文字の回転ではなく
+    // 書字方向を表す。
+    let ang = if upright_vertical {
+        0.0
+    } else {
+        t.escapement as f32 / 10.0 * std::f32::consts::PI / 180.0
+    };
     let (c, s) = (ang.cos(), ang.sin());
-    let base_y = py(t.y);
+    let text_y = if upright_vertical {
+        // 縦書きレコードは上端の基準点を使う一方、中間モデルはベースラインを
+        // 保持する。方向指定を外す前に、GDIの通常の補正分を加える。
+        t.y + t.size * 0.8
+    } else {
+        t.y
+    };
+    let base_y = py(text_y);
     out.push_str(&format!("BT /FJ {size:.2} Tf\n"));
     if t.bold {
         // Bold without a bold face: stroke the outline a little.
@@ -1934,5 +2114,40 @@ impl Writer {
             .as_bytes(),
         );
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_alpha;
+    use crate::domain::rendering::Raster;
+
+    #[test]
+    fn source_and_mask_zero_bits_become_opaque_alpha() {
+        let mask = Raster {
+            width: 8,
+            height: 1,
+            bits: 1,
+            palette: vec![(0, 0, 0), (255, 255, 255)],
+            rows: vec![0b0101_0101],
+            stencil: Some((0, 0, 0)),
+        };
+        assert_eq!(
+            mask_alpha(&mask, 8, 1),
+            Some(vec![255, 0, 255, 0, 255, 0, 255, 0])
+        );
+    }
+
+    #[test]
+    fn a_device_resolution_mask_is_resized_to_the_jpeg_size() {
+        let mask = Raster {
+            width: 4,
+            height: 2,
+            bits: 1,
+            palette: vec![(0, 0, 0), (255, 255, 255)],
+            rows: vec![0b0011_0000, 0b0011_0000],
+            stencil: Some((0, 0, 0)),
+        };
+        assert_eq!(mask_alpha(&mask, 2, 1), Some(vec![255, 0]));
     }
 }

@@ -51,7 +51,7 @@ fn elem(tag: u8, value: &[u8]) -> Vec<u8> {
 
 /// A small but complete container: one page with metadata, one raw page, a
 /// properties block and a trailer.
-fn sample() -> Vec<u8> {
+fn fixture() -> Vec<u8> {
     let mut body = Vec::new();
     let mut meta = elem(0x80, &[4]);
     meta.extend_from_slice(&elem(0x81, &2000u16.to_be_bytes()));
@@ -117,7 +117,7 @@ fn sample() -> Vec<u8> {
             return [header, doc].concat();
         }
     }
-    unreachable!("could not lay out the sample container")
+    unreachable!("could not lay out the fixture container")
 }
 
 /// Parse, and if that works use the result the way the tools do. Anything that
@@ -140,8 +140,8 @@ fn exercise(bytes: &[u8]) {
 }
 
 #[test]
-fn the_sample_itself_is_sound() {
-    let good = sample();
+fn the_fixture_itself_is_sound() {
+    let good = fixture();
     let doc = parse(&good).expect("the fixture must parse");
     assert_eq!(doc.pages.len(), 2);
     exercise(&good);
@@ -149,7 +149,7 @@ fn the_sample_itself_is_sound() {
 
 #[test]
 fn single_byte_corruption_never_panics() {
-    let good = sample();
+    let good = fixture();
     let mut rng = Rng(0x1234_5678_9ABC_DEF0);
     for _ in 0..4000 {
         let mut bad = good.clone();
@@ -161,7 +161,7 @@ fn single_byte_corruption_never_panics() {
 
 #[test]
 fn truncation_at_every_length_never_panics() {
-    let good = sample();
+    let good = fixture();
     for cut in 0..good.len() {
         exercise(&good[..cut]);
     }
@@ -169,7 +169,7 @@ fn truncation_at_every_length_never_panics() {
 
 #[test]
 fn wholesale_corruption_never_panics() {
-    let good = sample();
+    let good = fixture();
     let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
     for _ in 0..2000 {
         let mut bad = good.clone();
@@ -203,7 +203,7 @@ fn a_length_field_claiming_the_moon_is_refused() {
 
 #[test]
 fn page_offsets_pointing_outside_the_file_are_refused() {
-    let mut good = sample();
+    let mut good = fixture();
     // The offset table sits in the trailer; push every entry past the end.
     let n = good.len();
     let tlen = u32::from_le_bytes([good[n - 4], good[n - 3], good[n - 2], good[n - 1]]) as usize;

@@ -66,7 +66,7 @@ pub enum Role {
     Thumbnail,
     /// 直前の本文ページに配置された画像。
     Picture,
-    /// 平文の名前付きデータテーブル。
+    /// ページとして描画されないデータエントリ。
     Data,
 }
 
@@ -203,9 +203,7 @@ impl Page {
                         if m == KNOWN_COMPRESSION {
                             format!(" compression {m}")
                         } else {
-                            format!(
-                                " compression {m} (not the one seen in any sample; may be a standard codec)"
-                            )
+                            format!(" compression {m} (unclassified; may be a standard codec)")
                         }
                     })
                     .unwrap_or_default();

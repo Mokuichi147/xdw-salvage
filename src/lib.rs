@@ -41,7 +41,7 @@
 //! use xdw_salvage::{adapters::pdf, infrastructure};
 //!
 //! let service = infrastructure::local_service();
-//! let asset = service.open(Path::new("scan.xdw"))?;
+//! let asset = service.open(Path::new("input.xdw"))?;
 //! let bytes = &asset.data;
 //! let doc = &asset.document;
 //! let cov = doc.coverage();
@@ -52,18 +52,17 @@
 //! }
 //!
 //! let (file, report) = pdf::build(&bytes, &doc, pdf::Options::default());
-//! std::fs::write("scan.pdf", file)?;
+//! std::fs::write("output.pdf", file)?;
 //! println!("{} pages embedded", report.embedded);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! # Provenance
 //!
-//! An independent implementation, written from the observable behaviour of
-//! sample files plus publicly documented interface semantics. It contains no
-//! vendor code, headers or binaries, and none were disassembled. DocuWorks is a
-//! product of FUJIFILM Business Innovation; this crate is not affiliated with
-//! or endorsed by them.
+//! An independent implementation based on publicly documented interface
+//! semantics. It contains no vendor code, headers or binaries, and none were
+//! disassembled. DocuWorks is a product of FUJIFILM Business Innovation; this
+//! crate is not affiliated with or endorsed by them.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]

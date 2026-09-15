@@ -42,6 +42,33 @@ pub enum Source {
     Inline(usize),
 }
 
+/// Raster operation used by a bitmap placement.
+///
+/// The operation is part of the drawing semantics, not a hint about page
+/// orientation.  In particular, a colour picture bracketed by `SourceInvert`
+/// placements and an `And` bitmap is one masked picture operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RasterOp {
+    Copy,
+    And,
+    SourceInvert,
+    MaskPaint,
+    Other(u32),
+}
+
+impl RasterOp {
+    /// Translate the Win32 ROP3 values used by the metafile formats.
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            0x00CC_0020 => RasterOp::Copy,
+            0x0088_00C6 => RasterOp::And,
+            0x0066_0046 => RasterOp::SourceInvert,
+            0x00B8_074A => RasterOp::MaskPaint,
+            other => RasterOp::Other(other),
+        }
+    }
+}
+
 /// One picture placed on the page.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Image {
@@ -54,6 +81,8 @@ pub struct Image {
     pub src: (u32, u32),
     /// Which pixels to draw.
     pub source: Source,
+    /// The raster operation used for this placement.
+    pub raster_op: RasterOp,
     /// Position in the source's draw order.
     pub order: usize,
     /// The clip rectangle in force when the picture was drawn, if narrower
@@ -269,6 +298,56 @@ impl Metafile {
         (self.frame_mm100.0 as f32 * k, self.frame_mm100.1 as f32 * k)
     }
 
+    /// 文字レイヤーが正立した縦書き配置かどうか。
+    ///
+    /// メタファイルによっては、字を1字ずつ連続する縦座標へ配置し、直角の
+    /// エスケープメントだけで書字方向を示す。この指定を字ごとに適用すると
+    /// 字形そのものが回転してしまう。繰り返すx座標と直角の角度を使い、
+    /// 通常の回転ラベルと区別する。
+    pub fn uses_upright_vertical_text(&self) -> bool {
+        let runs: Vec<&Text> = self
+            .text
+            .iter()
+            .filter(|run| run.chars.iter().any(|c| !c.is_whitespace()))
+            .collect();
+        if runs.len() < 3
+            || runs
+                .iter()
+                .any(|run| run.chars.len() != 1 || run.xs.len() != 1)
+        {
+            return false;
+        }
+        let angle = runs[0].escapement.rem_euclid(3600);
+        if !matches!(angle, 900 | 2700)
+            || runs
+                .iter()
+                .any(|run| run.escapement.rem_euclid(3600) != angle)
+        {
+            return false;
+        }
+
+        let mut columns: Vec<f32> = Vec::new();
+        let mut repeated_column = false;
+        let mut varying_y = false;
+        let mut reference_y: Option<f32> = None;
+        for run in runs {
+            let Some(&x) = run.xs.first() else {
+                return false;
+            };
+            if columns.iter().any(|previous| (x - *previous).abs() <= 1.0) {
+                repeated_column = true;
+            } else {
+                columns.push(x);
+            }
+            if let Some(previous_y) = reference_y {
+                varying_y |= (run.y - previous_y).abs() > 1.0;
+            } else {
+                reference_y = Some(run.y);
+            }
+        }
+        repeated_column && varying_y
+    }
+
     /// Whether anything at all was recovered from this page.
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
@@ -356,6 +435,58 @@ pub fn pair_pictures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text(x: f32, y: f32, ch: char, escapement: i32) -> Text {
+        Text {
+            xs: vec![x],
+            y,
+            chars: vec![ch],
+            size: 10.0,
+            escapement,
+            rgb: (0, 0, 0),
+            order: 0,
+            bold: false,
+            underline: false,
+        }
+    }
+
+    #[test]
+    fn detects_glyphs_already_positioned_in_vertical_columns() {
+        let m = Metafile {
+            text: vec![
+                text(100.0, 10.0, '縦', 2700),
+                text(100.0, 20.0, '書', 2700),
+                text(80.0, 10.0, 'き', 2700),
+            ],
+            ..Metafile::default()
+        };
+        assert!(m.uses_upright_vertical_text());
+    }
+
+    #[test]
+    fn does_not_treat_a_single_rotated_run_as_vertical_writing() {
+        let m = Metafile {
+            text: vec![
+                text(100.0, 10.0, 'A', 2700),
+                text(110.0, 10.0, 'B', 2700),
+                text(120.0, 10.0, 'C', 2700),
+            ],
+            ..Metafile::default()
+        };
+        assert!(!m.uses_upright_vertical_text());
+    }
+
+    #[test]
+    fn classifies_the_raster_operations_used_by_picture_masks() {
+        assert_eq!(RasterOp::from_code(0x00CC_0020), RasterOp::Copy);
+        assert_eq!(RasterOp::from_code(0x0088_00C6), RasterOp::And);
+        assert_eq!(RasterOp::from_code(0x0066_0046), RasterOp::SourceInvert);
+        assert_eq!(RasterOp::from_code(0x00B8_074A), RasterOp::MaskPaint);
+        assert_eq!(
+            RasterOp::from_code(0x1234_5678),
+            RasterOp::Other(0x1234_5678)
+        );
+    }
 
     #[test]
     fn repeated_calls_for_one_size_share_the_one_stored_picture() {

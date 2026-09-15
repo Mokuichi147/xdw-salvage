@@ -1,7 +1,6 @@
 //! The page coding, and what comes out of it.
 //!
-//! No sample document is shipped with this crate, so every fixture here is
-//! built byte by byte in the test itself.
+//! Every fixture here is built byte by byte in the test itself.
 
 use xdw_salvage::domain::rendering;
 use xdw_salvage::infrastructure::{cp932, emf, lzh, wmf};
@@ -520,7 +519,7 @@ fn a_picture_placement_says_where_a_stored_image_goes() {
     body[6] = 500;
     body[9] = 128;
     body[10] = 64;
-    body[12] = 0x00CC_0020u32 as i32;
+    body[12] = 0x0066_0046u32 as i32;
     body[13] = 1000;
     body[14] = 1500;
     let mut comment = Vec::new();
@@ -545,6 +544,7 @@ fn a_picture_placement_says_where_a_stored_image_goes() {
             px: (128, 64)
         }
     );
+    assert_eq!(i.raster_op, rendering::RasterOp::SourceInvert);
     assert_eq!(page.image_sizes(), vec![(128, 64)]);
 }
 
