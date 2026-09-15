@@ -830,13 +830,13 @@ fn note_fonts(
         Lang::Japanese => {
             let descriptor = w.add(
                 "<< /Type /FontDescriptor /FontName /MS-Mincho /Flags 6 \
-                 /FontBBox [-200 -200 1200 1200] /ItalicAngle 0 \
-                 /Ascent 1000 /Descent -200 /CapHeight 700 /StemV 80 >>"
+                 /FontBBox [-1000 -140 1000 859] /ItalicAngle 0 \
+                 /Ascent 859 /Descent -140 /CapHeight 679 /StemV 1000 >>"
                     .to_string(),
             );
             let descendant = w.add(format!(
                 "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /MS-Mincho \
-                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 2 >> \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 4 >> \
                  /FontDescriptor {descriptor} 0 R /DW 1000 >>"
             ));
             // Without an embedded font, a reader that lacks the Japanese

@@ -821,6 +821,10 @@ fn a_japanese_note_always_comes_with_a_line_any_reader_can_draw() {
     assert!(text.contains("/UniJIS-UTF16-H"));
     assert!(text.contains("/Subtype /CIDFontType2"));
     assert!(text.contains("/BaseFont /MS-Mincho"));
+    assert!(text.contains("/Flags 6"));
+    assert!(text.contains("/FontBBox [-1000 -140 1000 859]"));
+    assert!(text.contains("/Ascent 859 /Descent -140 /CapHeight 679 /StemV 1000"));
+    assert!(text.contains("/Ordering (Japan1) /Supplement 4"));
     assert!(
         !text.contains("/FontFile2"),
         "default output embedded a font"
