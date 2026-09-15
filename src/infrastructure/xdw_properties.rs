@@ -74,6 +74,12 @@ pub fn pages(block: &[u8]) -> Vec<PageInfo> {
             }
             Some(LEVEL_CONTENT) => {
                 let Some(page) = out.last_mut() else { continue };
+                // A level-3 child describes the box of the next drawing,
+                // including the first drawing after a page record.  Most
+                // documents use that pattern for a page's small placed
+                // object (for example a preview/QR image); treating the
+                // first one as page-sized loses its physical placement.
+                let area = child.take();
                 if expecting_content {
                     expecting_content = false;
                     if let Some(r) = field(ROTATION).and_then(|v| ints(v).first().copied()) {
@@ -82,15 +88,14 @@ pub fn pages(block: &[u8]) -> Vec<PageInfo> {
                     if page.paper.is_none() {
                         page.paper = field(PAPER).and_then(pair);
                     }
-                    if let Some(o) = field(DRAWING).and_then(|v| drawing(v, None)) {
+                    if let Some(o) = field(DRAWING).and_then(|v| drawing(v, area)) {
                         page.overlays.push(o);
                     }
-                } else if let Some(o) = field(DRAWING).and_then(|v| drawing(v, child)) {
+                } else if let Some(o) = field(DRAWING).and_then(|v| drawing(v, area)) {
                     // An annotation: its drawing sits in the box the child
                     // record before it announced.
                     page.overlays.push(o);
                 }
-                child = None;
             }
             _ => {}
         }
@@ -227,9 +232,16 @@ mod tests {
         let mut with_drawing = vec![0x87, element.len() as u8];
         with_drawing.extend_from_slice(element);
         let mut block = record(&[&[0x80, 1, 2]]);
-        block.extend(record(&[&[0x80, 1, 3]]));
+        // The child before the page's first content drawing is its placement
+        // rectangle too, not only an annotation rectangle.
+        block.extend(record(&[
+            &[0x80, 1, 3],
+            &[0x9F, 0x34, 6, 2, 0x03, 0xE8, 2, 0x07, 0xD0],
+            &[0x9F, 0x8F, 0x51, 6, 2, 0x01, 0x2C, 2, 0x01, 0x90],
+        ]));
         block.extend(record(&[&[0x80, 1, 4], &with_drawing]));
-        // Child: position (1000, 2000), size (300, 400); then the annotation.
+        // The next child again supplies the position and size of the
+        // annotation.
         block.extend(record(&[
             &[0x80, 1, 3],
             &[0x9F, 0x34, 6, 2, 0x03, 0xE8, 2, 0x07, 0xD0],
@@ -240,7 +252,7 @@ mod tests {
         assert_eq!(pages.len(), 1);
         let overlays = &pages[0].overlays;
         assert_eq!(overlays.len(), 2);
-        assert_eq!(overlays[0].area, None);
+        assert_eq!(overlays[0].area, Some((1000, 2000, 300, 400)));
         assert_eq!(overlays[0].coded, vec![7, 8, 9]);
         assert_eq!(overlays[0].expanded, 10);
         assert_eq!(overlays[1].area, Some((1000, 2000, 300, 400)));

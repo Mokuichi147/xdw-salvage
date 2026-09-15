@@ -52,35 +52,32 @@ pub fn parse(data: &[u8]) -> Result<Document> {
 
     let (trailer, fields) = read_trailer(data)?;
     let declared_entries = tlv::find_uint(&fields, data, TR_PAGE_COUNT).unwrap_or(0) as u32;
-    let offsets = tlv::find(&fields, TR_PAGE_OFFSETS)
-        .map(|t| tlv::le_u32s(t.bytes(data)))
-        .ok_or(Error::MissingField {
-            tag: TR_PAGE_OFFSETS,
-            in_tag: trailer.tag,
-        })?;
+    let offsets = tlv::find(&fields, TR_PAGE_OFFSETS).map(|t| tlv::le_u32s(t.bytes(data)));
 
     // ページテーブルが壊れている場合はページ要素を直接スキャンして再構築する。
     let mut rebuilt = None;
-    let mut pages = Vec::with_capacity(offsets.len());
-    for (i, &off) in offsets.iter().enumerate() {
-        let off = off as usize;
-        if off >= data.len() {
-            rebuilt = Some(Rebuilt::OffsetOutsideFile);
-            break;
-        }
-        match crate::infrastructure::xdw_page::read(data, i, off) {
-            Ok(p) => pages.push(p),
-            Err(_) => {
-                rebuilt = Some(Rebuilt::OffsetNotAPage);
+    let mut pages = Vec::with_capacity(offsets.as_ref().map_or(0, Vec::len));
+    if let Some(offsets) = offsets.as_ref() {
+        for (i, &off) in offsets.iter().enumerate() {
+            let off = off as usize;
+            if off >= data.len() {
+                rebuilt = Some(Rebuilt::OffsetOutsideFile);
                 break;
             }
+            match crate::infrastructure::xdw_page::read(data, i, off) {
+                Ok(p) => pages.push(p),
+                Err(_) => {
+                    rebuilt = Some(Rebuilt::OffsetNotAPage);
+                    break;
+                }
+            }
         }
-    }
-    if rebuilt.is_some() {
-        pages.clear();
-        for (i, off) in scan_for_pages(data).into_iter().enumerate() {
-            if let Ok(p) = crate::infrastructure::xdw_page::read(data, i, off) {
-                pages.push(p);
+        if rebuilt.is_some() {
+            pages.clear();
+            for (i, off) in scan_for_pages(data).into_iter().enumerate() {
+                if let Ok(p) = crate::infrastructure::xdw_page::read(data, i, off) {
+                    pages.push(p);
+                }
             }
         }
     }
@@ -101,21 +98,61 @@ pub fn parse(data: &[u8]) -> Result<Document> {
     // The properties block says how each page is shown: its paper as
     // displayed and any rotation. A page element carries neither for a
     // picture page, and the rotation for no page at all.
-    if let (Some((at, stored)), Some(expanded)) = (properties, expanded) {
+    let shown = if let (Some((at, stored)), Some(expanded)) = (properties, expanded) {
         if let Some(coded) = data.get(at..at + stored) {
             if let Ok(block) = crate::infrastructure::lzh::decode(coded, expanded as usize) {
-                let shown = crate::infrastructure::xdw_properties::pages(&block);
-                let mut sheets = pages.iter_mut().filter(|p| p.is_sheet());
-                for info in shown {
-                    let Some(sheet) = sheets.next() else { break };
-                    sheet.rotation = info.rotation;
-                    if sheet.paper.is_none() {
-                        sheet.paper = info.paper;
-                    }
-                    sheet.overlays = info.overlays;
-                }
+                crate::infrastructure::xdw_properties::pages(&block)
+            } else {
+                Vec::new()
             }
+        } else {
+            Vec::new()
         }
+    } else {
+        Vec::new()
+    };
+    let mut sheets = pages.iter_mut().filter(|p| p.is_sheet());
+    for info in &shown {
+        let Some(sheet) = sheets.next() else { break };
+        sheet.rotation = info.rotation;
+        if sheet.paper.is_none() {
+            sheet.paper = info.paper;
+        }
+        sheet.overlays = info.overlays.clone();
+    }
+    // A few older exports retain the complete display description in the
+    // properties block but omit the page-offset field from their trailer. In
+    // that case the properties are the only trustworthy page table: preserve
+    // each described page as a synthetic sheet so its bitmap/text overlays can
+    // still be rendered. No bytes outside the properties block are guessed as
+    // page data.
+    if pages.is_empty() && offsets.is_none() {
+        if shown.is_empty() {
+            return Err(Error::MissingField {
+                tag: TR_PAGE_OFFSETS,
+                in_tag: trailer.tag,
+            });
+        }
+        pages = shown
+            .into_iter()
+            .enumerate()
+            .map(|(index, info)| Page {
+                index,
+                role: Role::Sheet,
+                belongs_to: None,
+                offset: trailer.start,
+                checksum: None,
+                paper: info.paper,
+                pixels: None,
+                rotation: info.rotation,
+                overlays: info.overlays,
+                data: PageData::Bare {
+                    offset: trailer.start,
+                    len: 0,
+                },
+                unknown_fields: Vec::new(),
+            })
+            .collect();
     }
 
     let (generations_present, unknown_tags) = survey(data);

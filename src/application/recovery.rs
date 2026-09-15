@@ -37,6 +37,16 @@ pub fn coverage<D: PageDecoder + ?Sized>(
         // the use case deterministic for a stateful custom decoder.
         if decode_page(data, page, decoder).is_some() {
             decoded_sheets += 1;
+        } else if page.overlays.iter().any(|overlay| {
+            decoder
+                .decode_overlay(overlay, page.paper.unwrap_or((21000, 29700)))
+                .is_some_and(|drawing| !drawing.is_empty())
+        }) {
+            // Older containers sometimes lose the page offset table while
+            // retaining a complete page drawing in document properties.
+            // Such a page is recoverable through its overlay even though its
+            // page body itself cannot be decoded.
+            decoded_sheets += 1;
         } else if !document.pictures_on(page.index).any(|p| p.is_recoverable()) {
             blank_sheets += 1;
         }

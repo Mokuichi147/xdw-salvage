@@ -151,7 +151,7 @@ impl Page {
     /// レポート用の1行説明。
     pub fn describe(&self) -> String {
         let mut line = self.describe_data();
-        if self.rotation % 360 != 0 {
+        if !self.rotation.is_multiple_of(360) {
             line.push_str(&format!("  shown turned {}°", self.rotation % 360));
         }
         let own = self.overlays.iter().filter(|o| o.area.is_none()).count();

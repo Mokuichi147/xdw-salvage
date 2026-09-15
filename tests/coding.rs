@@ -224,12 +224,12 @@ fn a_page_that_is_not_a_metafile_is_reported_as_such() {
 fn record_types_that_are_not_drawn_are_counted_rather_than_dropped() {
     let mut file = metafile_with_text(b"x", 0, 0);
     // Append a record this reader does not draw.
-    file.extend_from_slice(&42u32.to_le_bytes()); // EMR_ELLIPSE
+    file.extend_from_slice(&1234u32.to_le_bytes()); // an unsupported EMF record
     file.extend_from_slice(&24u32.to_le_bytes());
     file.extend_from_slice(&[0u8; 16]);
     let page = emf::read(&file).expect("reads");
     assert_eq!(
-        page.skipped.get(&42),
+        page.skipped.get(&1234),
         Some(&1),
         "a dropped record went unreported"
     );

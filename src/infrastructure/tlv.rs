@@ -62,7 +62,7 @@ pub fn read_len(data: &[u8], i: usize) -> Result<(usize, usize)> {
 pub fn read_one(data: &[u8], at: usize) -> Result<Tlv> {
     let tag = *data.get(at).ok_or(Error::BadLength { at })?;
     let (len, value) = read_len(data, at + 1)?;
-    if value.checked_add(len).map_or(true, |e| e > data.len()) {
+    if value.checked_add(len).is_none_or(|e| e > data.len()) {
         return Err(Error::Truncated { at, tag });
     }
     Ok(Tlv {
@@ -110,7 +110,9 @@ pub fn find_uint(items: &[Tlv], data: &[u8], tag: u8) -> Option<u64> {
 /// トレーラーのオフセット表で使われるリトルエンディアンのu32列を読む。
 pub fn le_u32s(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }

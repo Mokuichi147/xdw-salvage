@@ -315,6 +315,21 @@ pub fn pair_pictures(
     calls: &[(usize, (u32, u32))],
     stored: &[Option<(u32, u32)>],
 ) -> Vec<Option<usize>> {
+    // Some printer drivers emit two placement passes for every stored tile:
+    // the first pass is the mask and the second paints the colour.  The
+    // container de-duplicates the tile bytes, while the metafile retains both
+    // calls.  In that unambiguous shape, preserving the repeated pair is more
+    // informative than assigning every overflow call to the last tile.
+    if !stored.is_empty()
+        && calls.len() == stored.len() * 2
+        && calls
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|pair| pair[0].1 == pair[1].1)
+    {
+        return (0..calls.len()).map(|i| Some(i / 2)).collect();
+    }
     let mut taken = vec![false; stored.len()];
     let mut out = Vec::with_capacity(calls.len());
     for &(_, px) in calls {
@@ -373,5 +388,15 @@ mod tests {
         let stored = [Some((10, 10))];
         assert_eq!(pair_pictures(&calls, &stored), vec![Some(0)]);
         assert_eq!(pair_pictures(&calls, &[]), vec![None]);
+    }
+
+    #[test]
+    fn paired_mask_and_colour_passes_share_each_stored_picture() {
+        let calls = [(0, (20, 30)), (1, (20, 30)), (2, (40, 50)), (3, (40, 50))];
+        let stored = [Some((20, 30)), Some((40, 50))];
+        assert_eq!(
+            pair_pictures(&calls, &stored),
+            vec![Some(0), Some(0), Some(1), Some(1)]
+        );
     }
 }

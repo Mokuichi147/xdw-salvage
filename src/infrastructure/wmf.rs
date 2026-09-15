@@ -23,6 +23,7 @@ const META_INTERSECTCLIPRECT: u16 = 0x0416;
 const META_POLYGON: u16 = 0x0324;
 const META_POLYLINE: u16 = 0x0325;
 const META_RECTANGLE: u16 = 0x041B;
+const META_ELLIPSE: u16 = 0x0418;
 const META_ESCAPE: u16 = 0x0626;
 const META_PATBLT: u16 = 0x061D;
 const META_TEXTOUT: u16 = 0x0521;
@@ -171,6 +172,11 @@ pub fn read(d: &[u8], paper_mm100: (i32, i32)) -> Option<Metafile> {
             META_RECTANGLE => {
                 if let (Some(b), Some(rt), Some(t), Some(l)) = (p(0), p(1), p(2), p(3)) {
                     c.polygon(&[(l, t), (rt, t), (rt, b), (l, b)], true);
+                }
+            }
+            META_ELLIPSE => {
+                if let (Some(b), Some(rt), Some(t), Some(l)) = (p(0), p(1), p(2), p(3)) {
+                    c.ellipse(l, t, rt, b);
                 }
             }
             META_POLYGON | META_POLYLINE => {

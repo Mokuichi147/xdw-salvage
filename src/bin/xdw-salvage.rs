@@ -711,7 +711,7 @@ fn run_codec(files: &[String], dir: &Path) -> ExitCode {
             ));
             if let Some(e) = s.expanded {
                 let ratio = e as f64 / s.len as f64;
-                if leanest.as_ref().map_or(true, |(best, ..)| ratio > *best) {
+                if leanest.as_ref().is_none_or(|(best, ..)| ratio > *best) {
                     leanest = Some((
                         ratio,
                         out.file_name()

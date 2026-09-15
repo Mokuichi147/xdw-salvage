@@ -122,6 +122,57 @@ fn margin_of(pw: f32, ph: f32) -> f32 {
     (pw.min(ph) * 0.06).clamp(2.0, 28.0)
 }
 
+/// Whether a sheet is small enough to plausibly be a text label attached to a
+/// preceding image page.  The decision is based only on the page's declared
+/// geometry and drawing contents; it does not depend on a document name or on
+/// the text carried by a particular sample.
+fn is_text_only_label(page: &Page) -> bool {
+    let Some((w, h)) = page.paper else {
+        return false;
+    };
+    w > 0 && h > 0 && w.max(h) <= 3000 && w.min(h) >= 300 && w.saturating_mul(h) <= 9_000_000
+}
+
+/// A serial label has only one short, printable ASCII text layer.  Requiring
+/// no other drawing primitives keeps ordinary small forms from being merged
+/// accidentally with a preceding JPEG.
+fn serial_label(meta: &Metafile) -> bool {
+    let chars: Vec<char> = meta
+        .text
+        .iter()
+        .flat_map(|t| t.chars.iter().copied())
+        .collect();
+    !chars.is_empty()
+        && chars.len() <= 64
+        && meta.text.len() == 1
+        && meta.images.is_empty()
+        && meta.rasters.is_empty()
+        && meta.fills.is_empty()
+        && meta.shapes.is_empty()
+        && chars
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.' | ':' | ' '))
+}
+
+/// Place a small label near the upper-right corner of its image page.  The
+/// label's own frame supplies its physical text size; only its anchor is lost
+/// when the vendor stores it as a separate saved-over sheet.
+fn serial_label_place(meta: &Metafile, pw: f32, ph: f32) -> Option<Place> {
+    let (w, h) = meta.points();
+    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+        return None;
+    }
+    let right = (pw * 0.10).max(8.0);
+    let top = (ph * 0.04).max(4.0);
+    Some(Place {
+        x: (pw - right - w).max(0.0),
+        top: top.min((ph - h).max(0.0)),
+        w,
+        h,
+        ph,
+    })
+}
+
 /// Lay the artwork belonging to one sheet onto the lower part of that sheet.
 ///
 /// Their true positions live inside the sheet's own coding, so this makes no
@@ -420,8 +471,38 @@ where
         .filter(|p| p.is_sheet() || (opts.include_previews && p.is_preview()))
         .collect();
 
+    // Some saved-over documents keep a small, text-only serial-number sheet
+    // immediately after the JPEG it annotates.  It is a drawing layer, not a
+    // second page: decode it once here, then paint it onto the preceding JPEG
+    // and omit it from the output page sequence.
+    let mut merged_labels: Vec<Option<Metafile>> = vec![None; selected.len()];
+    let mut merge_label = vec![false; selected.len()];
+    if opts.decode {
+        for i in 1..selected.len() {
+            let previous = selected[i - 1];
+            let label = selected[i];
+            if !matches!(previous.data, PageData::Jpeg { .. })
+                || !label.is_sheet()
+                || !is_text_only_label(label)
+            {
+                continue;
+            }
+            let Some(meta) = recovery::decode_page(data, label, decoder) else {
+                continue;
+            };
+            if serial_label(&meta) {
+                merged_labels[i] = Some(meta);
+                merge_label[i] = true;
+            }
+        }
+    }
+
+    let mut page_no = 0usize;
     for (ordinal, p) in selected.iter().enumerate() {
-        let page_no = ordinal + 1;
+        if merge_label[ordinal] {
+            continue;
+        }
+        page_no += 1;
         // The page is drawn the way it is stored; the reader turns it the
         // way the document says it is shown.
         let rotate = if p.rotation % 360 != 0 {
@@ -450,8 +531,8 @@ where
                 // A picture page may carry a drawing of its own that says
                 // where the picture and its companions go and what is
                 // written over them. When it does, that is the page.
-                let mut content = String::new();
-                let mut xobjects = String::new();
+                let mut overlay = String::new();
+                let mut overlay_xobjects = String::new();
                 let over = if opts.decode && p.overlays.iter().any(|o| o.area.is_none()) {
                     draw_overlays(
                         &mut w,
@@ -461,8 +542,8 @@ where
                         decoder,
                         pw,
                         ph,
-                        &mut content,
-                        &mut xobjects,
+                        &mut overlay,
+                        &mut overlay_xobjects,
                         opts.font.as_deref(),
                         &mut used_glyphs,
                         &mut glyph_widths,
@@ -472,6 +553,7 @@ where
                     Drawn {
                         glyphs: 0,
                         pictures: 0,
+                        painted: false,
                     }
                 };
                 if over.pictures > 0 {
@@ -482,10 +564,10 @@ where
                             font_resources(latin, cjk)
                         }
                     };
-                    let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
+                    let cid = w.add_stream("<< >>".to_string(), overlay.as_bytes());
                     let pid = w.add(format!(
                         "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
-                         /Resources << /Font << {fonts} >> /XObject << {xobjects} >> >> \
+                         /Resources << /Font << {fonts} >> /XObject << {overlay_xobjects} >> >> \
                          /Contents {cid} 0 R >>"
                     ));
                     kids.push(pid);
@@ -539,13 +621,57 @@ where
                         &mut xobjects,
                     );
                 }
+                // Text-only page overlays belong above the JPEG. Draw them
+                // after the image so they cannot disappear underneath it.
+                let mut drawn_glyphs = 0usize;
+                if over.painted && over.pictures == 0 {
+                    content.push_str(&overlay);
+                    xobjects.push_str(&overlay_xobjects);
+                    drawn_glyphs += over.glyphs;
+                }
+                if let Some(label) = merged_labels.get(ordinal + 1).and_then(Option::as_ref) {
+                    if let Some(place) = serial_label_place(label, pw, ph) {
+                        let drawn = draw_page(
+                            &mut w,
+                            data,
+                            &[],
+                            label,
+                            place,
+                            "L",
+                            &mut content,
+                            &mut xobjects,
+                            opts.font.as_deref(),
+                            &mut used_glyphs,
+                            &mut glyph_widths,
+                            &mut glyph_remapper,
+                        );
+                        drawn_glyphs += drawn.glyphs;
+                    }
+                }
+                let fonts = if drawn_glyphs > 0 {
+                    match embedded {
+                        Some(id) => format!("/FJ {id} 0 R"),
+                        None => {
+                            let (latin, cjk) = note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                            font_resources(latin, cjk)
+                        }
+                    }
+                } else {
+                    String::new()
+                };
+                let resources = if fonts.is_empty() {
+                    format!("/XObject << {xobjects} >>")
+                } else {
+                    format!("/Font << {fonts} >> /XObject << {xobjects} >>")
+                };
                 let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
                 let pid = w.add(format!(
                     "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
-                     /Resources << /XObject << {xobjects} >> >> /Contents {cid} 0 R >>"
+                     /Resources << {resources} >> /Contents {cid} 0 R >>"
                 ));
                 kids.push(pid);
                 report.embedded += 1;
+                report.glyphs += drawn_glyphs;
             }
             // The sheet is in the container's own coding. Expand it: what comes
             // out is a metafile, and its text is real text with real positions,
@@ -616,14 +742,70 @@ where
             }
             _ if opts.missing == Missing::Placeholder => {
                 let (pw, ph) = opts.paper.or_else(|| p.paper_points()).unwrap_or(A4);
-                let (latin, cjk) = note_fonts(&mut w, &mut font_id, opts.lang);
+                // Recovered overlays use the same Japanese CID font as a
+                // decoded page even when the placeholder note language is
+                // English. `draw_text` emits every recovered run through
+                // /FJ, so reserve that resource before drawing the overlay.
+                let overlay_lang = if p.overlays.is_empty() {
+                    opts.lang
+                } else {
+                    Lang::Japanese
+                };
+                let (latin, cjk) = note_fonts(&mut w, &mut font_id, overlay_lang);
+                let mut content = String::new();
+                let mut xobjects = String::new();
+                let over = if opts.decode && !p.overlays.is_empty() {
+                    draw_overlays(
+                        &mut w,
+                        data,
+                        doc,
+                        p,
+                        decoder,
+                        pw,
+                        ph,
+                        &mut content,
+                        &mut xobjects,
+                        opts.font.as_deref(),
+                        &mut used_glyphs,
+                        &mut glyph_widths,
+                        &mut glyph_remapper,
+                    )
+                } else {
+                    Drawn {
+                        glyphs: 0,
+                        pictures: 0,
+                        painted: false,
+                    }
+                };
+                if over.painted {
+                    let fonts = match embedded {
+                        Some(id) => format!("/FJ {id} 0 R"),
+                        None => font_resources(latin, cjk),
+                    };
+                    let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
+                    let pid = w.add(format!(
+                        "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
+                         /Resources << /Font << {fonts} >>{} >> /Contents {cid} 0 R >>",
+                        if xobjects.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" /XObject << {xobjects} >>")
+                        }
+                    ));
+                    kids.push(pid);
+                    report.drawn += 1;
+                    report.glyphs += over.glyphs;
+                    report.pictures_placed += over.pictures;
+                    continue;
+                }
+
                 let mut content = placeholder_content(pw, ph, page_no, opts.lang);
 
                 // The sheet itself cannot be reproduced, but the pictures it is
                 // made of are plain JPEG. Stack them on the sheet rather than
                 // leaving it blank: a pamphlet page comes back as its artwork,
                 // which is a great deal better than an empty rectangle.
-                let mut xobjects = String::new();
+                xobjects.clear();
                 let runs = doc.picture_runs(p.index);
                 let placed =
                     stack_pictures(&mut w, data, &runs, pw, ph, &mut content, &mut xobjects);
@@ -793,8 +975,10 @@ where
     }
     info.push_str(&format!(
         " /Subject (recovered {} of {} page(s); {} placeholder(s), {} attachment(s)) >>",
-        report.embedded,
-        report.embedded + report.placeholders + report.skipped,
+        report.embedded + report.drawn,
+        selected
+            .len()
+            .saturating_sub(merge_label.iter().filter(|v| **v).count()),
         report.placeholders,
         report.attachments
     ));
@@ -974,7 +1158,7 @@ fn embed_font(
     };
     let mut prev: Option<u16> = None;
     for &gid in used.keys() {
-        if prev.map_or(true, |p| gid != p + 1) {
+        if prev.is_none_or(|p| gid != p + 1) {
             flush(&mut widths, run_start, &mut run);
             run_start = Some(gid);
         }
@@ -1024,6 +1208,7 @@ fn embed_font(
 struct Drawn {
     glyphs: usize,
     pictures: usize,
+    painted: bool,
 }
 
 /// Turn a page's drawing model into PDF content.
@@ -1074,6 +1259,7 @@ fn draw_page(
     let mut drawn = Drawn {
         glyphs: 0,
         pictures: 0,
+        painted: false,
     };
     let (ux, uy) = meta.units_per_point();
     if !(ux.is_finite() && uy.is_finite()) || ux <= 0.0 || uy <= 0.0 {
@@ -1221,6 +1407,7 @@ fn draw_page(
                 if !(x.is_finite() && y.is_finite() && fw > 0.0 && fh > 0.0) {
                     continue;
                 }
+                drawn.painted = true;
                 if fill_colour != Some(f.rgb) {
                     fill_colour = Some(f.rgb);
                     out.push_str(&format!("{} rg\n", colour(f.rgb)));
@@ -1248,6 +1435,7 @@ fn draw_page(
                 {
                     continue;
                 }
+                drawn.painted = true;
                 let stencil = match img.source {
                     Source::Inline(i) => meta.rasters.get(i).and_then(|r| r.stencil),
                     Source::Stored { .. } => None,
@@ -1268,6 +1456,7 @@ fn draw_page(
                 if s.path.is_empty() {
                     continue;
                 }
+                drawn.painted = true;
                 if let Some(rgb) = s.fill {
                     if fill_colour != Some(rgb) {
                         fill_colour = Some(rgb);
@@ -1295,7 +1484,7 @@ fn draw_page(
             }
             Item::Text(t) => {
                 set_clip(out, (None, None), &mut clip_open, &mut fill_colour);
-                drawn.glyphs += draw_text(
+                let glyphs = draw_text(
                     t,
                     px,
                     py,
@@ -1308,6 +1497,8 @@ fn draw_page(
                     remapper,
                     &mut fill_colour,
                 );
+                drawn.glyphs += glyphs;
+                drawn.painted |= glyphs > 0;
             }
         }
     }
@@ -1340,6 +1531,7 @@ fn draw_overlays<D: PageDecoder + ?Sized>(
     let mut total = Drawn {
         glyphs: 0,
         pictures: 0,
+        painted: false,
     };
     let paper = p.paper.unwrap_or((21000, 29700));
     // A page overlay names every picture of the page in storage order, the
@@ -1353,7 +1545,7 @@ fn draw_overlays<D: PageDecoder + ?Sized>(
         let Some(meta) = decoder.decode_overlay(overlay, paper) else {
             continue;
         };
-        let place = match overlay.area {
+        let mut place = match overlay.area {
             None => Place::sheet(pw, ph),
             Some((x, y, aw, ah)) => Place {
                 x: x as f32 * PT,
@@ -1363,6 +1555,14 @@ fn draw_overlays<D: PageDecoder + ?Sized>(
                 ph,
             },
         };
+        // Legacy kind-1 WMFs carry point-sized text in their own coordinate
+        // system. Their properties rectangle is the anchor, not a scale box;
+        // using it as the WMF frame shrinks a 12-point label to a few points.
+        // Keep the anchor and use one PDF point per WMF device unit.
+        if overlay.kind == 1 && overlay.area.is_some() && !meta.text.is_empty() {
+            place.w = meta.device.0.max(1) as f32;
+            place.h = meta.device.1.max(1) as f32;
+        }
         let stored: &[&Page] = if overlay.area.is_none() { &group } else { &[] };
         let d = draw_page(
             w,
@@ -1380,6 +1580,7 @@ fn draw_overlays<D: PageDecoder + ?Sized>(
         );
         total.glyphs += d.glyphs;
         total.pictures += d.pictures;
+        total.painted |= d.painted;
     }
     total
 }

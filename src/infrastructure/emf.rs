@@ -6,6 +6,8 @@ use crate::infrastructure::gdi::{i32_at, rgb, u32_at, Canvas, Font, Object};
 const REC_HEAD: usize = 8;
 
 const EMR_HEADER: u32 = 1;
+const EMR_MOVETOEX: u32 = 27;
+const EMR_LINETO: u32 = 54;
 const EMR_POLYGON: u32 = 3;
 const EMR_POLYLINE: u32 = 4;
 const EMR_SETWINDOWEXTEX: u32 = 9;
@@ -21,6 +23,7 @@ const EMR_SELECTOBJECT: u32 = 37;
 const EMR_CREATEPEN: u32 = 38;
 const EMR_CREATEBRUSHINDIRECT: u32 = 39;
 const EMR_DELETEOBJECT: u32 = 40;
+const EMR_ELLIPSE: u32 = 42;
 const EMR_RECTANGLE: u32 = 43;
 const EMR_GDICOMMENT: u32 = 70;
 const EMR_BITBLT: u32 = 76;
@@ -52,6 +55,7 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
 
     let mut at = 0usize;
     let mut guard = d.len() / REC_HEAD + 2;
+    let mut moved: Option<(i32, i32)> = Some((0, 0));
     while at + REC_HEAD <= d.len() && guard > 0 {
         guard -= 1;
         let kind = u32_at(d, at)?;
@@ -90,6 +94,19 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
                     (i32_at(r, 8), i32_at(r, 12), i32_at(r, 16), i32_at(r, 20))
                 {
                     c.set_clip_rect(l, t, rt, b);
+                }
+            }
+            EMR_MOVETOEX => {
+                if let (Some(x), Some(y)) = (i32_at(r, 8), i32_at(r, 12)) {
+                    moved = Some((x, y));
+                }
+            }
+            EMR_LINETO => {
+                if let (Some((from_x, from_y)), Some(x), Some(y)) =
+                    (moved, i32_at(r, 8), i32_at(r, 12))
+                {
+                    c.polygon(&[(from_x, from_y), (x, y)], false);
+                    moved = Some((x, y));
                 }
             }
             EMR_EXTCREATEFONTINDIRECTW => {
@@ -161,6 +178,13 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
                     (i32_at(r, 8), i32_at(r, 12), i32_at(r, 16), i32_at(r, 20))
                 {
                     c.polygon(&[(l, t), (rt, t), (rt, b), (l, b)], true);
+                }
+            }
+            EMR_ELLIPSE => {
+                if let (Some(l), Some(t), Some(rt), Some(b)) =
+                    (i32_at(r, 8), i32_at(r, 12), i32_at(r, 16), i32_at(r, 20))
+                {
+                    c.ellipse(l, t, rt, b);
                 }
             }
             EMR_POLYGON | EMR_POLYLINE => {
@@ -276,10 +300,8 @@ fn text_out(r: &[u8], wide: bool, c: &mut Canvas) -> bool {
         return false;
     };
     let chars: Vec<char> = if wide {
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
+        let (pairs, _) = bytes.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|c| u16::from_le_bytes(*c)).collect();
         String::from_utf16_lossy(&units).chars().collect()
     } else {
         crate::infrastructure::cp932::decode(bytes)

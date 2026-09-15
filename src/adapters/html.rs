@@ -96,13 +96,42 @@ where
         .filter(|p| p.is_sheet() || (opts.include_previews && p.is_preview()))
         .collect();
 
+    // A small text-only sheet immediately following a JPEG is a saved
+    // drawing layer in some exports.  Keep the HTML page sequence aligned
+    // with the PDF adapter by merging that layer onto its image page.
+    let mut merged_labels: Vec<Option<Metafile>> = vec![None; selected.len()];
+    let mut merge_label = vec![false; selected.len()];
+    if opts.decode {
+        for i in 1..selected.len() {
+            let previous = selected[i - 1];
+            let label = selected[i];
+            if !matches!(previous.data, PageData::Jpeg { .. })
+                || !label.is_sheet()
+                || !is_text_only_label(label)
+            {
+                continue;
+            }
+            let Some(meta) = recovery::decode_page(data, label, decoder) else {
+                continue;
+            };
+            if serial_label(&meta) {
+                merged_labels[i] = Some(meta);
+                merge_label[i] = true;
+            }
+        }
+    }
+
     let title = opts.title.clone().unwrap_or_else(|| "document".into());
     let t = Text::for_lang(opts.lang);
 
     let mut body = String::new();
     let mut gaps: Vec<usize> = Vec::new();
+    let mut no = 0usize;
     for (i, p) in selected.iter().enumerate() {
-        let no = i + 1;
+        if merge_label[i] {
+            continue;
+        }
+        no += 1;
         let decoded = opts
             .decode
             .then(|| recovery::decode_page(data, p, decoder))
@@ -110,8 +139,14 @@ where
         // A picture page with a drawing of its own is drawn from that
         // drawing, which places the picture and whatever sits over it.
         let overlaid = opts.decode
-            && p.is_recoverable()
-            && p.overlays.iter().any(|o| o.area.is_none())
+            && !p.overlays.is_empty()
+            // A missing page body can still have a complete drawing in the
+            // properties block.  A decoded page body is handled together
+            // with its own drawing below, so do not replace it here.  A JPEG
+            // needs a page-level overlay; annotation-only drawings must stay
+            // on the normal image path.
+            && ((!p.is_recoverable() && decoded.is_none())
+                || (p.is_recoverable() && p.overlays.iter().any(|o| o.area.is_none())))
             && draw_sheet(p, None, data, doc, decoder, no, &t, &mut body)
                 .map(|(g, d)| {
                     report.embedded += 1;
@@ -126,12 +161,33 @@ where
             PageData::Jpeg { offset, len } if offset + len <= data.len() => {
                 report.embedded += 1;
                 let (w, h) = p.pixels.unwrap_or((0, 0));
-                body.push_str(&format!(
-                    "<figure class=\"page\" id=\"p{no}\">\n<img loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n<figcaption>{} &middot; {w}&times;{h}px</figcaption>\n</figure>\n",
-                    esc(&t.page_alt(no)),
-                    b64(&data[offset..offset + len]),
-                    esc(&t.page_label(no)),
-                ));
+                if let Some(label) = merged_labels.get(i + 1).and_then(Option::as_ref) {
+                    let paper = p.paper.unwrap_or((21000, 29700));
+                    let pw = paper.0 as f32 * 72.0 / 2540.0;
+                    let ph = paper.1 as f32 * 72.0 / 2540.0;
+                    let mut svg = String::new();
+                    let mut spans = String::new();
+                    let place = serial_label_place(label, pw, ph);
+                    let (g, d) =
+                        draw_metafile(label, data, &[], place, "l", no, &t, &mut svg, &mut spans);
+                    report.glyphs += g;
+                    report.pictures += d;
+                    body.push_str(&format!(
+                        "<figure class=\"page\" id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet\" style=\"aspect-ratio:{:.4}\">\n<img class=\"art\" style=\"left:0%;top:0%;width:100%;height:100%\" loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n{svg}{spans}</div>\n</div>\n<figcaption>{} &middot; {w}&times;{h}px</figcaption>\n</figure>\n",
+                        pw / ph,
+                        pw / ph,
+                        esc(&t.page_alt(no)),
+                        b64(&data[offset..offset + len]),
+                        esc(&t.page_label(no)),
+                    ));
+                } else {
+                    body.push_str(&format!(
+                        "<figure class=\"page\" id=\"p{no}\">\n<img loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n<figcaption>{} &middot; {w}&times;{h}px</figcaption>\n</figure>\n",
+                        esc(&t.page_alt(no)),
+                        b64(&data[offset..offset + len]),
+                        esc(&t.page_label(no)),
+                    ));
+                }
             }
             // The sheet is in the container's own coding. Expand it and draw
             // the metafile's text: the page comes back as real, selectable
@@ -226,7 +282,12 @@ where
 
     let mut head_note = format!(
         "{} &middot; {}",
-        t.count(report.embedded, selected.len()),
+        t.count(
+            report.embedded,
+            selected
+                .len()
+                .saturating_sub(merge_label.iter().filter(|v| **v).count()),
+        ),
         esc(&title)
     );
     if report.gaps > 0 {
@@ -427,14 +488,14 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 /// Standard base64 with padding.
 fn b64(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    let mut chunks = data.chunks_exact(3);
-    for c in &mut chunks {
+    let (chunks, remainder) = data.as_chunks::<3>();
+    for c in chunks {
         let n = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
         for shift in [18, 12, 6, 0] {
             out.push(ALPHABET[((n >> shift) & 63) as usize] as char);
         }
     }
-    match chunks.remainder() {
+    match remainder {
         [a] => {
             let n = (*a as u32) << 16;
             out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
@@ -451,6 +512,51 @@ fn b64(data: &[u8]) -> String {
         _ => {}
     }
     out
+}
+
+/// Whether a sheet is small enough to plausibly be a text label attached to a
+/// preceding image page.  It uses only the page geometry, never a document
+/// name or a sample-specific value.
+fn is_text_only_label(page: &Page) -> bool {
+    let Some((w, h)) = page.paper else {
+        return false;
+    };
+    w > 0 && h > 0 && w.max(h) <= 3000 && w.min(h) >= 300 && w.saturating_mul(h) <= 9_000_000
+}
+
+/// A serial label has one short, printable ASCII text run and no other
+/// drawing primitives, which keeps the merge conservative.
+fn serial_label(meta: &Metafile) -> bool {
+    let chars: Vec<char> = meta
+        .text
+        .iter()
+        .flat_map(|t| t.chars.iter().copied())
+        .collect();
+    !chars.is_empty()
+        && chars.len() <= 64
+        && meta.text.len() == 1
+        && meta.images.is_empty()
+        && meta.rasters.is_empty()
+        && meta.fills.is_empty()
+        && meta.shapes.is_empty()
+        && chars
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.' | ':' | ' '))
+}
+
+/// Put a small label near the upper-right of the image it follows.  The
+/// label's frame gives its physical size; only its anchor is absent from the
+/// saved-over sheet representation.
+fn serial_label_place(meta: &Metafile, pw: f32, ph: f32) -> Place {
+    let (w, h) = meta.points();
+    let right = (pw * 0.10).max(8.0);
+    let top = (ph * 0.04).max(4.0);
+    Place {
+        x: ((pw - right - w).max(0.0)) / pw,
+        y: top.min((ph - h).max(0.0)) / ph,
+        w: (w / pw).clamp(0.0, 1.0),
+        h: (h / ph).clamp(0.0, 1.0),
+    }
 }
 
 /// Where a drawing lands on the sheet, as fractions of the sheet: left,
@@ -756,6 +862,8 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
     let (pw, ph) = (paper.0 as f32 * PT, paper.1 as f32 * PT);
     let mut svg = String::new();
     let mut spans = String::new();
+    let initial_svg_len = svg.len();
+    let initial_spans_len = spans.len();
     let (mut glyphs, mut pictures) = (0usize, 0usize);
     if let Some(m) = main {
         let stored: Vec<&Page> = doc.pictures_on(p.index).collect();
@@ -782,7 +890,7 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
         let Some(m) = decoder.decode_overlay(overlay, paper) else {
             continue;
         };
-        let place = match overlay.area {
+        let mut place = match overlay.area {
             None => Place::SHEET,
             Some((x, y, w, h)) => Place {
                 x: x as f32 * PT / pw,
@@ -791,6 +899,13 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
                 h: h as f32 * PT / ph,
             },
         };
+        // Legacy kind-1 WMFs carry point-sized text in their own device
+        // coordinate system.  The properties rectangle is the anchor, not a
+        // scale box; keep the same physical sizing used by the PDF adapter.
+        if overlay.kind == 1 && overlay.area.is_some() && !m.text.is_empty() {
+            place.w = m.device.0.max(1) as f32 * PT / pw;
+            place.h = m.device.1.max(1) as f32 * PT / ph;
+        }
         let stored: &[&Page] = if overlay.area.is_none() { &group } else { &[] };
         let (g, d) = draw_metafile(
             &m,
@@ -806,7 +921,9 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
         glyphs += g;
         pictures += d;
     }
-    if main.is_none() && pictures == 0 {
+    // A properties-only page can contain selectable text or vector shapes but
+    // no picture.  Do not discard it merely because the picture count is zero.
+    if main.is_none() && svg.len() == initial_svg_len && spans.len() == initial_spans_len {
         return None;
     }
     // The sheet keeps the stored proportions; a page shown turned is turned
@@ -871,7 +988,43 @@ fn artwork(data: &[u8], doc: &Document, index: usize, no: usize, t: &Text) -> (S
 
 #[cfg(test)]
 mod tests {
-    use super::b64;
+    use super::{b64, build_with, Options};
+    use crate::application::ports::PageDecoder;
+    use crate::domain::page::{Overlay, Page, PageData, Role};
+    use crate::domain::rendering::{Metafile, Text};
+    use crate::domain::Document;
+
+    #[derive(Debug)]
+    struct PropertiesOnlyText;
+
+    impl PageDecoder for PropertiesOnlyText {
+        fn decode(&self, _data: &[u8], _page: &Page) -> Option<Metafile> {
+            None
+        }
+
+        fn decode_overlay(
+            &self,
+            _overlay: &Overlay,
+            _paper: (u32, u32),
+        ) -> Option<Metafile> {
+            Some(Metafile {
+                device: (100, 100),
+                frame_mm100: (21000, 29700),
+                text: vec![Text {
+                    xs: vec![10.0],
+                    y: 20.0,
+                    chars: vec!['A'],
+                    size: 10.0,
+                    escapement: 0,
+                    rgb: (0, 0, 0),
+                    order: 0,
+                    bold: false,
+                    underline: false,
+                }],
+                ..Metafile::default()
+            })
+        }
+    }
 
     #[test]
     fn base64_matches_the_standard() {
@@ -884,5 +1037,55 @@ mod tests {
         assert_eq!(b64(b"foobar"), "Zm9vYmFy");
         assert_eq!(b64(&[0xFF, 0xFF, 0xFF]), "////");
         assert_eq!(b64(&[0x00, 0x00, 0x00]), "AAAA");
+    }
+
+    #[test]
+    fn properties_only_text_is_not_reported_as_a_gap() {
+        let document = Document {
+            generation: 7,
+            guard: [0; 4],
+            trailer_tag: 0x65,
+            trailer_at: 0,
+            declared_entries: 1,
+            pages: vec![Page {
+                index: 0,
+                role: Role::Sheet,
+                belongs_to: None,
+                offset: 0,
+                checksum: None,
+                paper: Some((21000, 29700)),
+                pixels: None,
+                rotation: 0,
+                overlays: vec![Overlay {
+                    kind: 1,
+                    expanded: 1,
+                    coded: Vec::new(),
+                    area: None,
+                }],
+                data: PageData::Bare { offset: 0, len: 0 },
+                unknown_fields: Vec::new(),
+            }],
+            properties: None,
+            properties_len: None,
+            image_derived: Vec::new(),
+            checksum: None,
+            generations_present: 1,
+            unknown_tags: Vec::new(),
+            rebuilt: None,
+        };
+        let options = Options {
+            embed_originals: false,
+            ..Options::default()
+        };
+        let (html, report) = build_with(
+            &[],
+            &document,
+            &options,
+            &PropertiesOnlyText,
+            &crate::infrastructure::MagicAttachmentScanner,
+        );
+        assert_eq!(report.embedded, 1);
+        assert_eq!(report.gaps, 0);
+        assert!(html.contains(">A</span>"));
     }
 }

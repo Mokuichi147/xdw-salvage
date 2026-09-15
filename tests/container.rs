@@ -1241,7 +1241,7 @@ fn a_broken_page_table_is_rebuilt_by_scanning() {
     let start = n - tlen;
     let mut patched = false;
     for i in start..n - 6 {
-        if file[i] == 0x81 && file[i + 1] as usize % 4 == 0 && file[i + 1] > 0 {
+        if file[i] == 0x81 && (file[i + 1] as usize).is_multiple_of(4) && file[i + 1] > 0 {
             let count = file[i + 1] as usize;
             for k in (0..count).step_by(4) {
                 let at = i + 2 + k;

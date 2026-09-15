@@ -20,6 +20,10 @@ pub const SRCCOPY: u32 = 0x00CC_0020;
 /// Paint the brush where the source is black, leave the rest: the raster
 /// operation GDI uses to draw a monochrome bitmap as a coloured stencil.
 pub const MASK_PAINT: u32 = 0x00B8_074A;
+/// Keep the destination where the source bitmap is white and clear it where
+/// the source is black.  DocuWorks uses this for monochrome masks embedded in
+/// an EMF rather than for ordinary opaque pictures.
+pub const SRCAND: u32 = 0x0088_00C6;
 
 /// GDI stock objects are selected by an index with the top bit set.
 const STOCK: u32 = 0x8000_0000;
@@ -72,7 +76,16 @@ mod dw {
     pub const OP_LINE: u8 = 0x01;
     pub const OP_POLYLINE_TO: u8 = 0x02;
     pub const OP_POLYGON: u8 = 0x03;
+    /// Extended path segments emitted by the DocuWorks printer driver.  The
+    /// first point starts a figure and the following points are cubic
+    /// control/control/end triples.
+    pub const OP_EXTENDED_CONTINUE: u8 = 0x10;
+    pub const OP_EXTENDED_START: u8 = 0x11;
+    pub const OP_EXTENDED_APPEND: u8 = 0x12;
     pub const OP_BEZIER: u8 = 0x13;
+    /// A direct two-point segment used by the printer driver's annotation
+    /// layer, outside a begin/end path pair.
+    pub const OP_LINE_DIRECT: u8 = 0x40;
     pub const OP_FILLED_POLYGON: u8 = 0x20;
     pub const CODE_I16: u8 = 0x20;
     pub const CODE_I8: u8 = 0x40;
@@ -384,6 +397,20 @@ impl Canvas {
                 return true;
             };
             raster.stencil = Some(colour);
+        } else if rop == SRCAND {
+            // The source is a monochrome mask: a zero bit clears the
+            // destination and a one bit leaves it alone.  An image mask with
+            // black as its painted colour has exactly that effect on the
+            // white paper used by the PDF and HTML adapters.
+            if raster.bits != 1 {
+                return false;
+            }
+            if raster.palette.get(1) == Some(&(0, 0, 0)) {
+                for byte in &mut raster.rows {
+                    *byte = !*byte;
+                }
+            }
+            raster.stencil = Some((0, 0, 0));
         } else if rop != SRCCOPY {
             return false;
         }
@@ -445,6 +472,44 @@ impl Canvas {
             even_odd: self.even_odd,
         };
         self.paint(path, closed, true, order);
+    }
+
+    /// Paint an axis-aligned ellipse using four cubic Bézier segments.
+    ///
+    /// GDI exposes ellipses as a primitive while the neutral model only needs
+    /// paths.  The control-point approximation is exact enough for PDF/HTML
+    /// output at ordinary page resolution and preserves both the selected
+    /// brush and pen.
+    pub fn ellipse(&mut self, left: i32, top: i32, right: i32, bottom: i32) {
+        let order = self.advance();
+        let (l, t) = self.device(left.min(right), top.min(bottom));
+        let (r, b) = self.device(left.max(right), top.max(bottom));
+        let left = l.min(r);
+        let right = l.max(r);
+        let top = t.min(b);
+        let bottom = t.max(b);
+        if right <= left || bottom <= top {
+            return;
+        }
+        let cx = (left + right) * 0.5;
+        let cy = (top + bottom) * 0.5;
+        let rx = (right - left) * 0.5;
+        let ry = (bottom - top) * 0.5;
+        let k = 0.552_284_8;
+        let path = Path {
+            figures: vec![Figure {
+                start: (right, cy),
+                segments: vec![
+                    Segment::Curve((right, cy + k * ry), (cx + k * rx, bottom), (cx, bottom)),
+                    Segment::Curve((cx - k * rx, bottom), (left, cy + k * ry), (left, cy)),
+                    Segment::Curve((left, cy - k * ry), (cx - k * rx, top), (cx, top)),
+                    Segment::Curve((cx + k * rx, top), (right, cy - k * ry), (right, cy)),
+                ],
+                closed: true,
+            }],
+            even_odd: self.even_odd,
+        };
+        self.paint(path, true, true, order);
     }
 
     fn paint(&mut self, path: Path, fill: bool, stroke: bool, order: usize) {
@@ -618,6 +683,10 @@ impl Canvas {
         let Some(points) = decode_points(body) else {
             return false;
         };
+        if op == dw::OP_LINE_DIRECT {
+            self.polygon(&points, false);
+            return true;
+        }
         let pts: Vec<(f32, f32)> = points.iter().map(|&(x, y)| self.device(x, y)).collect();
         match op {
             dw::OP_FILLED_POLYGON => {
@@ -636,12 +705,23 @@ impl Canvas {
                 self.paint(path, true, true, order);
                 true
             }
-            dw::OP_POLYLINE_TO => {
+            dw::OP_POLYLINE | dw::OP_LINE | dw::OP_POLYLINE_TO => {
                 let Some(path) = self.path.as_mut() else {
                     return false;
                 };
                 match path.figures.last_mut() {
-                    Some(f) => f.segments.extend(pts.iter().map(|p| Segment::Line(*p))),
+                    Some(f) => {
+                        // These records continue the current figure.  The
+                        // first record after a begin-path starts it; keeping
+                        // subsequent records in the same figure is important
+                        // for outlines made from several straight segments.
+                        if f.segments.is_empty() && f.start == pts[0] {
+                            f.segments
+                                .extend(pts[1..].iter().map(|p| Segment::Line(*p)));
+                        } else {
+                            f.segments.extend(pts.iter().map(|p| Segment::Line(*p)));
+                        }
+                    }
                     None => {
                         if let Some((first, rest)) = pts.split_first() {
                             path.figures.push(Figure {
@@ -654,7 +734,7 @@ impl Canvas {
                 }
                 true
             }
-            dw::OP_POLYLINE | dw::OP_LINE | dw::OP_POLYGON => {
+            dw::OP_POLYGON => {
                 let Some(path) = self.path.as_mut() else {
                     return false;
                 };
@@ -662,8 +742,36 @@ impl Canvas {
                     path.figures.push(Figure {
                         start: *first,
                         segments: rest.iter().map(|p| Segment::Line(*p)).collect(),
-                        closed: op == dw::OP_POLYGON,
+                        closed: true,
                     });
+                }
+                true
+            }
+            dw::OP_EXTENDED_START | dw::OP_EXTENDED_CONTINUE | dw::OP_EXTENDED_APPEND => {
+                let Some(path) = self.path.as_mut() else {
+                    return false;
+                };
+                let Some((first, rest)) = pts.split_first() else {
+                    return true;
+                };
+                let curves = |points: &[(f32, f32)]| {
+                    points
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .map(|c| Segment::Curve(c[0], c[1], c[2]))
+                        .collect::<Vec<_>>()
+                };
+                if op == dw::OP_EXTENDED_START || path.figures.is_empty() {
+                    path.figures.push(Figure {
+                        start: *first,
+                        segments: curves(rest),
+                        closed: false,
+                    });
+                } else if let Some(figure) = path.figures.last_mut() {
+                    // A continuation consists only of control/control/end
+                    // triples; its first point is not a repeated move-to.
+                    figure.segments.extend(curves(&pts));
                 }
                 true
             }
@@ -675,7 +783,9 @@ impl Canvas {
                     path.figures.push(Figure {
                         start: *first,
                         segments: rest
-                            .chunks_exact(3)
+                            .as_chunks::<3>()
+                            .0
+                            .iter()
                             .map(|c| Segment::Curve(c[0], c[1], c[2]))
                             .collect(),
                         closed: true,
@@ -989,6 +1099,89 @@ mod tests {
         assert_eq!(c.page.shapes[0].fill, Some((1, 2, 3)));
         assert_eq!(c.page.shapes[0].stroke, None);
         assert_eq!(c.page.shapes[0].path.figures[0].segments.len(), 3);
+    }
+
+    #[test]
+    fn a_direct_line_comment_is_painted_without_a_path() {
+        let mut c = Canvas::new((100, 100), (1000, 1000));
+        c.select(STOCK | NULL_BRUSH);
+        let line = geometry(0x40, dw::CODE_I16, 2, (10, 20), &[30, 0, 40, 0]);
+        assert!(c.comment(&line));
+        assert_eq!(c.page.shapes.len(), 1);
+        assert_eq!(c.page.shapes[0].path.figures[0].start, (10.0, 20.0));
+        assert_eq!(
+            c.page.shapes[0].path.figures[0].segments,
+            vec![Segment::Line((30.0, 40.0))]
+        );
+    }
+
+    #[test]
+    fn extended_path_comments_keep_cubic_segments_together() {
+        let mut c = Canvas::new((100, 100), (1000, 1000));
+        c.select(STOCK | NULL_BRUSH);
+        let start = geometry(
+            0x11,
+            dw::CODE_I16,
+            4,
+            (0, 0),
+            &[10, 0, 0, 0, 20, 0, 10, 0, 30, 0, 20, 0],
+        );
+        let continuation = geometry(
+            0x10,
+            dw::CODE_I16,
+            3,
+            (40, 30),
+            &[50, 0, 40, 0, 60, 0, 50, 0],
+        );
+        assert!(c.comment(b"DW02"));
+        assert!(c.comment(&start));
+        assert!(c.comment(&continuation));
+        assert!(c.comment(b"DW05"));
+        assert_eq!(c.page.shapes.len(), 1);
+        assert_eq!(c.page.shapes[0].path.figures[0].segments.len(), 2);
+        assert!(matches!(
+            c.page.shapes[0].path.figures[0].segments[0],
+            Segment::Curve((10.0, 0.0), (20.0, 10.0), (30.0, 20.0))
+        ));
+        assert!(matches!(
+            c.page.shapes[0].path.figures[0].segments[1],
+            Segment::Curve((40.0, 30.0), (50.0, 40.0), (60.0, 50.0))
+        ));
+    }
+
+    #[test]
+    fn an_ellipse_becomes_a_closed_four_curve_path() {
+        let mut c = Canvas::new((100, 100), (1000, 1000));
+        c.ellipse(10, 20, 50, 80);
+        assert_eq!(c.page.shapes.len(), 1);
+        let figure = &c.page.shapes[0].path.figures[0];
+        assert!(figure.closed);
+        assert_eq!(figure.segments.len(), 4);
+        assert!(figure
+            .segments
+            .iter()
+            .all(|s| matches!(s, Segment::Curve(..))));
+    }
+
+    #[test]
+    fn srcand_turns_a_black_palette_entry_into_a_black_stencil() {
+        let mut info = Vec::new();
+        info.extend_from_slice(&40u32.to_le_bytes());
+        info.extend_from_slice(&1i32.to_le_bytes());
+        info.extend_from_slice(&1i32.to_le_bytes());
+        info.extend_from_slice(&1u16.to_le_bytes());
+        info.extend_from_slice(&1u16.to_le_bytes());
+        info.extend_from_slice(&0u32.to_le_bytes());
+        info.extend_from_slice(&[0u8; 12]);
+        info.extend_from_slice(&2u32.to_le_bytes());
+        info.extend_from_slice(&0u32.to_le_bytes());
+        // DIB palette entries are B, G, R, reserved: white then black.
+        info.extend_from_slice(&[255, 255, 255, 0, 0, 0, 0, 0]);
+
+        let mut c = Canvas::new((1, 1), (100, 100));
+        assert!(c.stretch_dib(&info, &[0x80, 0, 0, 0], (0, 0, 1, 1), (0, 0, 1, 1), SRCAND));
+        assert_eq!(c.page.rasters[0].stencil, Some((0, 0, 0)));
+        assert_eq!(c.page.rasters[0].rows, vec![0x7f]);
     }
 
     #[test]
