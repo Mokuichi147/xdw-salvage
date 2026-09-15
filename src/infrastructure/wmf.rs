@@ -4,7 +4,7 @@
 //! Records are counted in 16-bit words, coordinates are 16-bit, and objects
 //! are addressed by slot number rather than handle.
 
-use crate::domain::rendering::Metafile;
+use crate::domain::rendering::{FontKind, Metafile};
 use crate::infrastructure::gdi::{i16_at, rgb, u16_at, u32_at, Canvas, Font, Object};
 
 const HEADER_WORDS: usize = 9;
@@ -122,6 +122,7 @@ pub fn read(d: &[u8], paper_mm100: (i32, i32)) -> Option<Metafile> {
                             escapement: esc,
                             weight,
                             underline: r.get(6 + 11).is_some_and(|&u| u != 0),
+                            kind: FontKind::Japanese,
                         }),
                     );
                 }

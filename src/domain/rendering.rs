@@ -9,6 +9,19 @@
 
 use std::collections::HashMap;
 
+/// The font family selected by the source metafile for a text run.
+///
+/// Keeping this at run level matters: the same ASCII hyphen can have a
+/// different shape and width in a Japanese proportional face than in Verdana.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontKind {
+    #[default]
+    Japanese,
+    JapaneseProportional,
+    JapaneseProportionalGothic,
+    Latin,
+}
+
 /// One run of characters, already positioned.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Text {
@@ -18,6 +31,8 @@ pub struct Text {
     pub y: f32,
     /// The characters, one per entry in `xs`.
     pub chars: Vec<char>,
+    /// The source font family selected for this run.
+    pub font_kind: FontKind,
     /// Character height in device units, always positive.
     pub size: f32,
     /// Tenths of a degree counter-clockwise; 0 for ordinary horizontal text.
@@ -441,6 +456,7 @@ mod tests {
             xs: vec![x],
             y,
             chars: vec![ch],
+            font_kind: FontKind::Japanese,
             size: 10.0,
             escapement,
             rgb: (0, 0, 0),

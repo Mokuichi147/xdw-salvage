@@ -11,7 +11,8 @@
 use std::collections::HashMap;
 
 use crate::domain::rendering::{
-    Figure, Fill, Image, Metafile, Path, Raster, RasterOp, Rect, Segment, Shape, Source, Text,
+    Figure, Fill, FontKind, Image, Metafile, Path, Raster, RasterOp, Rect, Segment, Shape, Source,
+    Text,
 };
 use crate::infrastructure::dib;
 
@@ -41,6 +42,8 @@ pub struct Font {
     pub escapement: i32,
     pub weight: i32,
     pub underline: bool,
+    /// The font family selected by the source for this font object.
+    pub kind: FontKind,
 }
 
 /// What a selectable object is.
@@ -336,6 +339,7 @@ impl Canvas {
             xs,
             y: baseline,
             chars,
+            font_kind: self.font.kind,
             size,
             escapement: self.font.escapement,
             rgb: self.text_rgb,

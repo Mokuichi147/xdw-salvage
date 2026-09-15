@@ -1016,6 +1016,7 @@ mod tests {
                     xs: vec![10.0],
                     y: 20.0,
                     chars: vec!['A'],
+                    font_kind: crate::domain::rendering::FontKind::Japanese,
                     size: 10.0,
                     escapement: 0,
                     rgb: (0, 0, 0),

@@ -1,6 +1,6 @@
 //! 復号後のWindows拡張メタファイルをドメインモデルへ変換するパーサー。
 
-use crate::domain::rendering::Metafile;
+use crate::domain::rendering::{FontKind, Metafile};
 use crate::infrastructure::gdi::{i32_at, rgb, u32_at, Canvas, Font, Object};
 
 const REC_HEAD: usize = 8;
@@ -120,6 +120,7 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
                             escapement: esc,
                             weight,
                             underline: r.get(33).is_some_and(|&u| u != 0),
+                            kind: emf_font_kind(r),
                         }),
                     );
                 }
@@ -214,6 +215,30 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
         at += size;
     }
     Some(c.finish())
+}
+
+/// Classify the face selected by an EMF font object.  Charset distinguishes
+/// ANSI text from Japanese text; the face name distinguishes MS Mincho from
+/// its proportional Japanese companion.
+fn emf_font_kind(r: &[u8]) -> FontKind {
+    if r.get(35) == Some(&0) {
+        return FontKind::Latin;
+    }
+    let face = r
+        .get(40..104)
+        .unwrap_or_default()
+        .chunks_exact(2)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .take_while(|&u| u != 0)
+        .collect::<Vec<_>>();
+    let face = String::from_utf16_lossy(&face);
+    if face.contains("ゴシック") || face.contains("Gothic") {
+        FontKind::JapaneseProportionalGothic
+    } else if face.contains('Ｐ') || face.contains(" P") {
+        FontKind::JapaneseProportional
+    } else {
+        FontKind::Japanese
+    }
 }
 
 /// A pen from its style, logical width and colour.

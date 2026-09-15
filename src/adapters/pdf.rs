@@ -10,7 +10,7 @@ use crate::application::recovery;
 pub use crate::domain::output::Language as Lang;
 use crate::domain::page::{Page, PageData};
 use crate::domain::rendering::{
-    self, Fill, Image, Metafile, Raster, RasterOp, Rect, Segment, Shape, Source, Text,
+    self, Fill, FontKind, Image, Metafile, Raster, RasterOp, Rect, Segment, Shape, Source, Text,
 };
 use crate::domain::Document;
 use crate::infrastructure::{deflate, jpeg, ttf, LzhMetafileDecoder, MagicAttachmentScanner};
@@ -440,7 +440,13 @@ where
 {
     let mut w = Writer::new();
     let pages_id = w.reserve();
-    let mut font_id: Option<(usize, Option<usize>)> = None;
+    let mut font_id: Option<(
+        usize,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+    )> = None;
     // One embedded font serves every page, but which glyphs it must carry is
     // only known once every page has been drawn, so its id is reserved now and
     // its body written at the end.
@@ -558,10 +564,21 @@ where
                 };
                 if over.pictures > 0 {
                     let fonts = match embedded {
-                        Some(id) => format!("/FJ {id} 0 R"),
+                        Some(id) => {
+                            let (_, cjk, mincho, pmincho, pgothic) =
+                                note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                            format!(
+                                "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
+                                cjk.expect("Japanese font"),
+                                mincho.expect("MS Mincho font"),
+                                pmincho.expect("MS P Mincho font"),
+                                pgothic.expect("MS P Gothic font")
+                            )
+                        }
                         None => {
-                            let (latin, cjk) = note_fonts(&mut w, &mut font_id, Lang::Japanese);
-                            font_resources(latin, cjk)
+                            let (latin, cjk, mincho, pmincho, pgothic) =
+                                note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                            font_resources(latin, cjk, mincho, pmincho, pgothic)
                         }
                     };
                     let cid = w.add_stream("<< >>".to_string(), overlay.as_bytes());
@@ -649,10 +666,21 @@ where
                 }
                 let fonts = if drawn_glyphs > 0 {
                     match embedded {
-                        Some(id) => format!("/FJ {id} 0 R"),
+                        Some(id) => {
+                            let (_, cjk, mincho, pmincho, pgothic) =
+                                note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                            format!(
+                                "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
+                                cjk.expect("Japanese font"),
+                                mincho.expect("MS Mincho font"),
+                                pmincho.expect("MS P Mincho font"),
+                                pgothic.expect("MS P Gothic font")
+                            )
+                        }
                         None => {
-                            let (latin, cjk) = note_fonts(&mut w, &mut font_id, Lang::Japanese);
-                            font_resources(latin, cjk)
+                            let (latin, cjk, mincho, pmincho, pgothic) =
+                                note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                            font_resources(latin, cjk, mincho, pmincho, pgothic)
                         }
                     }
                 } else {
@@ -716,10 +744,21 @@ where
                 );
                 let (glyphs, placed) = (drawn.glyphs + over.glyphs, drawn.pictures + over.pictures);
                 let fonts = match embedded {
-                    Some(id) => format!("/FJ {id} 0 R"),
+                    Some(id) => {
+                        let (_, cjk, mincho, pmincho, pgothic) =
+                            note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                        format!(
+                            "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
+                            cjk.expect("Japanese font"),
+                            mincho.expect("MS Mincho font"),
+                            pmincho.expect("MS P Mincho font"),
+                            pgothic.expect("MS P Gothic font")
+                        )
+                    }
                     None => {
-                        let (latin, cjk) = note_fonts(&mut w, &mut font_id, Lang::Japanese);
-                        font_resources(latin, cjk)
+                        let (latin, cjk, mincho, pmincho, pgothic) =
+                            note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                        font_resources(latin, cjk, mincho, pmincho, pgothic)
                     }
                 };
 
@@ -743,14 +782,15 @@ where
                 let (pw, ph) = opts.paper.or_else(|| p.paper_points()).unwrap_or(A4);
                 // Recovered overlays use the same Japanese CID font as a
                 // decoded page even when the placeholder note language is
-                // English. `draw_text` emits every recovered run through
-                // /FJ, so reserve that resource before drawing the overlay.
+                // English. Reserve all source-face resources before drawing
+                // the overlay; draw_text selects them per recovered run.
                 let overlay_lang = if p.overlays.is_empty() {
                     opts.lang
                 } else {
                     Lang::Japanese
                 };
-                let (latin, cjk) = note_fonts(&mut w, &mut font_id, overlay_lang);
+                let (latin, cjk, mincho, pmincho, pgothic) =
+                    note_fonts(&mut w, &mut font_id, overlay_lang);
                 let mut content = String::new();
                 let mut xobjects = String::new();
                 let over = if opts.decode && !p.overlays.is_empty() {
@@ -778,8 +818,18 @@ where
                 };
                 if over.painted {
                     let fonts = match embedded {
-                        Some(id) => format!("/FJ {id} 0 R"),
-                        None => font_resources(latin, cjk),
+                        Some(id) => {
+                            let (_, cjk, mincho, pmincho, pgothic) =
+                                note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                            format!(
+                                "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
+                                cjk.expect("Japanese font"),
+                                mincho.expect("MS Mincho font"),
+                                pmincho.expect("MS P Mincho font"),
+                                pgothic.expect("MS P Gothic font")
+                            )
+                        }
+                        None => font_resources(latin, cjk, mincho, pmincho, pgothic),
                     };
                     let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
                     let pid = w.add(format!(
@@ -814,7 +864,7 @@ where
                 let pid = w.add(format!(
                     "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
                      /Resources << /Font << {} >>{} >> /Contents {cid} 0 R >>",
-                    font_resources(latin, cjk),
+                    font_resources(latin, cjk, mincho, pmincho, pgothic),
                     if xobjects.is_empty() {
                         String::new()
                     } else {
@@ -830,13 +880,13 @@ where
     }
 
     if kids.is_empty() {
-        let (latin, cjk) = note_fonts(&mut w, &mut font_id, opts.lang);
+        let (latin, cjk, mincho, pmincho, pgothic) = note_fonts(&mut w, &mut font_id, opts.lang);
         let content = placeholder_content(A4.0, A4.1, 0, opts.lang);
         let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
         let pid = w.add(format!(
             "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 595.28 841.89] \
              /Resources << /Font << {} >> >> /Contents {cid} 0 R >>",
-            font_resources(latin, cjk)
+            font_resources(latin, cjk, mincho, pmincho, pgothic)
         ));
         kids.push(pid);
     }
@@ -997,9 +1047,21 @@ where
 /// clumsy one.
 fn note_fonts(
     w: &mut Writer,
-    cache: &mut Option<(usize, Option<usize>)>,
+    cache: &mut Option<(
+        usize,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+    )>,
     lang: Lang,
-) -> (usize, Option<usize>) {
+) -> (
+    usize,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+) {
     if let Some(ids) = *cache {
         return ids;
     }
@@ -1043,8 +1105,50 @@ fn note_fonts(
             )))
         }
     };
-    *cache = Some((latin, cjk));
-    (latin, cjk)
+    let mincho = match lang {
+        Lang::English => None,
+        Lang::Japanese => Some(named_japanese_font(w, "MS-Mincho")),
+    };
+    let pmincho = match lang {
+        Lang::English => None,
+        Lang::Japanese => Some(named_japanese_font(w, "MS-PMincho")),
+    };
+    let pgothic = match lang {
+        Lang::English => None,
+        Lang::Japanese => Some(named_japanese_font(w, "MS-PGothic")),
+    };
+    *cache = Some((latin, cjk, mincho, pmincho, pgothic));
+    (latin, cjk, mincho, pmincho, pgothic)
+}
+
+/// A Japanese system face used by a source text run.  It is deliberately
+/// separate from the comparison face (`/FJ`): the latter may be HeiseiMin-W3,
+/// while ASCII punctuation in a source MS-Mincho run must retain its original
+/// font metrics and glyph design.
+fn named_japanese_font(w: &mut Writer, name: &str) -> usize {
+    let descriptor = w.add(format!(
+        "<< /Type /FontDescriptor /FontName /{name} /Flags 6 \
+         /ItalicAngle 0 /Ascent 859 /Descent -140 /CapHeight 679 /StemV 1000 >>"
+    ));
+    let descendant = w.add(format!(
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{name} \
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 4 >> \
+         /FontDescriptor {descriptor} 0 R /DW 1000 >>"
+    ));
+    let to_unicode = w.add_stream(
+        "<< >>".to_string(),
+        b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n\
+          /CMapName /Identity-UCS def /CMapType 2 def\n\
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+          1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
+          1 beginbfrange <0000> <FFFF> <0000> endbfrange\n\
+          endcmap CMapName currentdict /CMap defineresource pop end end",
+    );
+    w.add(format!(
+        "<< /Type /Font /Subtype /Type0 /BaseFont /{name} \
+         /Encoding /UniJIS-UTF16-H /DescendantFonts [{descendant} 0 R] \
+         /ToUnicode {to_unicode} 0 R >>"
+    ))
 }
 
 /// Wordings for a placeholder, longest first, so the fullest one that fits at a
@@ -1095,11 +1199,27 @@ fn notes(page_no: usize, lang: Lang) -> Vec<String> {
 }
 
 /// The font entries a placeholder page needs in its resource dictionary.
-fn font_resources(latin: usize, cjk: Option<usize>) -> String {
-    match cjk {
-        Some(j) => format!("/FA {latin} 0 R /FJ {j} 0 R"),
-        None => format!("/FA {latin} 0 R"),
+fn font_resources(
+    latin: usize,
+    cjk: Option<usize>,
+    mincho: Option<usize>,
+    pmincho: Option<usize>,
+    pgothic: Option<usize>,
+) -> String {
+    let mut fonts = format!("/FA {latin} 0 R");
+    if let Some(j) = cjk {
+        fonts.push_str(&format!(" /FJ {j} 0 R"));
     }
+    if let Some(m) = mincho {
+        fonts.push_str(&format!(" /FM {m} 0 R"));
+    }
+    if let Some(p) = pmincho {
+        fonts.push_str(&format!(" /FP {p} 0 R"));
+    }
+    if let Some(g) = pgothic {
+        fonts.push_str(&format!(" /FG {g} 0 R"));
+    }
+    fonts
 }
 
 /// Rough width of a string in em units, for fitting text to a page.
@@ -1877,11 +1997,6 @@ fn draw_text(
         t.y
     };
     let base_y = py(text_y);
-    out.push_str(&format!("BT /FJ {size:.2} Tf\n"));
-    if t.bold {
-        // Bold without a bold face: stroke the outline a little.
-        out.push_str(&format!("2 Tr {} RG {:.2} w\n", colour(t.rgb), size * 0.03));
-    }
     let mut placed = 0usize;
     let mut last_x: Option<f32> = None;
     for (i, ch) in t.chars.iter().enumerate() {
@@ -1892,10 +2007,22 @@ fn draw_text(
         if !(x.is_finite() && base_y.is_finite()) {
             continue;
         }
+        // Keep the font choice made by the source for the whole run.  An
+        // ASCII hyphen in a Japanese-font run is not equivalent to a hyphen in
+        // a Verdana run, so character-class routing is intentionally avoided.
+        let ascii = ch.is_ascii_graphic() || *ch == ' ';
+        let embedded_latin = t.font_kind == FontKind::Latin && ascii;
+        let text_font = match (t.font_kind, ascii) {
+            (FontKind::Latin, true) => "/FA",
+            (FontKind::JapaneseProportional, true) => "/FP",
+            (FontKind::JapaneseProportionalGothic, true) => "/FG",
+            (FontKind::Japanese, true) => "/FM",
+            (_, false) => "/FJ",
+        };
         let mut hex = String::from("<");
-        match font {
-            // With a font of our own, the operand is a glyph index.
-            Some(f) => match f.glyph(*ch) {
+        match (font, embedded_latin) {
+            // With a font of our own, the operand is a remapped glyph index.
+            (Some(f), true) => match f.glyph(*ch) {
                 Some(old_gid) => {
                     let gid = remapper
                         .as_mut()
@@ -1906,26 +2033,34 @@ fn draw_text(
                 }
                 None => continue,
             },
-            // Otherwise the reader's own Japanese face maps UTF-16 directly.
-            None => {
+            // The Japanese face maps UTF-16 directly for non-Latin runs.
+            (_, false) => {
                 let mut buf = [0u16; 2];
                 for unit in ch.encode_utf16(&mut buf) {
                     hex.push_str(&format!("{unit:04X}"));
                 }
             }
+            (None, true) => {
+                hex.push_str(&format!("{:02X}", *ch as u32));
+            }
         }
         hex.push('>');
+        out.push_str(&format!("BT {text_font} {size:.2} Tf\n"));
+        if t.bold {
+            // Bold without a bold face: stroke the outline a little.
+            out.push_str(&format!("2 Tr {} RG {:.2} w\n", colour(t.rgb), size * 0.03));
+        }
         out.push_str(&format!(
             "{c:.5} {s:.5} {:.5} {c:.5} {x:.2} {base_y:.2} Tm {hex} Tj\n",
             -s
         ));
+        if t.bold {
+            out.push_str("0 Tr\n");
+        }
+        out.push_str("ET\n");
         last_x = Some(x + size * if (*ch as u32) < 0x100 { 0.55 } else { 1.0 });
         placed += 1;
     }
-    if t.bold {
-        out.push_str("0 Tr\n");
-    }
-    out.push_str("ET\n");
     if t.underline && t.escapement == 0 {
         if let (Some(first), Some(last)) = (t.xs.first(), last_x) {
             let y = base_y - size * 0.12;
