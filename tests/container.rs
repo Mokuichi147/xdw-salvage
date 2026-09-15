@@ -255,7 +255,7 @@ fn pdf_embeds_recoverable_pages_and_marks_the_rest() {
 
     assert_eq!(report.embedded, 1);
     assert_eq!(report.placeholders, 1);
-    assert!(bytes.starts_with(b"%PDF-1.4"));
+    assert!(bytes.starts_with(b"%PDF-1.5"));
     assert!(bytes.ends_with(b"%%EOF\n"));
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("/DCTDecode"));
@@ -818,8 +818,9 @@ fn a_japanese_note_always_comes_with_a_line_any_reader_can_draw() {
 
     // Both faces are declared and both are used.
     assert!(text.contains("/Subtype /Type0"), "no Japanese font");
-    assert!(text.contains("/UniJIS-UCS2-H"));
-    assert!(text.contains("/BaseFont /HeiseiMin-W3"));
+    assert!(text.contains("/UniJIS-UTF16-H"));
+    assert!(text.contains("/Subtype /CIDFontType2"));
+    assert!(text.contains("/BaseFont /MS-Mincho"));
     assert!(
         !text.contains("/FontFile2"),
         "default output embedded a font"

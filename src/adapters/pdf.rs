@@ -35,10 +35,11 @@ pub struct Options {
     pub decode: bool,
     /// A TrueType font supplied by the caller for the recovered page text.
     ///
-    /// Without one the PDF names a standard Japanese face and relies on the
-    /// reader having it, which keeps the output small. With one, only the
-    /// glyphs used in the document are embedded, so the caller's font license
-    /// must permit embedding and redistribution in the resulting PDF.
+    /// Without one the PDF names the `MS-Mincho` Japanese system face and
+    /// relies on the reader having a matching face, which keeps the output
+    /// small. With one, only the glyphs used in the document are embedded, so
+    /// the caller's font license must permit embedding and redistribution in
+    /// the resulting PDF.
     pub font: Option<std::sync::Arc<ttf::Font>>,
     /// Include preview entries as pages. Off by default: they are low
     /// resolution copies of other pages, not content.
@@ -804,11 +805,13 @@ where
 /// The fonts a placeholder note may need: always Helvetica, plus a Japanese
 /// face when one is asked for.
 ///
-/// The Japanese face is a standard character collection rather than an embedded font,
-/// which keeps the file small but leaves the glyphs to the reader. Readers
-/// without the mapping installed draw nothing at all for them, so a Japanese
-/// note is always accompanied by a plain line that every reader can show. A
-/// placeholder that renders blank would be worse than a clumsy one.
+/// The Japanese face is a Windows system font rather than an embedded font,
+/// which keeps the file small but leaves the glyphs to the reader. The modern
+/// UTF-16 CMap covers the Japanese Unicode mappings used by current PDF
+/// readers. Readers without the mapping installed draw nothing at all for
+/// them, so a Japanese note is always accompanied by a plain line that every
+/// reader can show. A placeholder that renders blank would be worse than a
+/// clumsy one.
 fn note_fonts(
     w: &mut Writer,
     cache: &mut Option<(usize, Option<usize>)>,
@@ -825,12 +828,17 @@ fn note_fonts(
     let cjk = match lang {
         Lang::English => None,
         Lang::Japanese => {
-            let descendant = w.add(
-                "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /HeiseiMin-W3 \
-                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 4 >> \
-                 /DW 1000 >>"
+            let descriptor = w.add(
+                "<< /Type /FontDescriptor /FontName /MS-Mincho /Flags 6 \
+                 /FontBBox [-200 -200 1200 1200] /ItalicAngle 0 \
+                 /Ascent 1000 /Descent -200 /CapHeight 700 /StemV 80 >>"
                     .to_string(),
             );
+            let descendant = w.add(format!(
+                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /MS-Mincho \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 2 >> \
+                 /FontDescriptor {descriptor} 0 R /DW 1000 >>"
+            ));
             // Without an embedded font, a reader that lacks the Japanese
             // character collection draws nothing and, worse, copies nothing.
             // A ToUnicode map costs a few hundred bytes and makes the text
@@ -846,8 +854,8 @@ fn note_fonts(
                   endcmap CMapName currentdict /CMap defineresource pop end end",
             );
             Some(w.add(format!(
-                "<< /Type /Font /Subtype /Type0 /BaseFont /HeiseiMin-W3 \
-                 /Encoding /UniJIS-UCS2-H /DescendantFonts [{descendant} 0 R] \
+                "<< /Type /Font /Subtype /Type0 /BaseFont /MS-Mincho \
+                 /Encoding /UniJIS-UTF16-H /DescendantFonts [{descendant} 0 R] \
                  /ToUnicode {to_unicode} 0 R >>"
             )))
         }
@@ -1698,7 +1706,7 @@ impl Writer {
 
     fn finish(self, root: usize, info: Option<usize>) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
-        out.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+        out.extend_from_slice(b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n");
         let mut offsets = vec![0usize; self.objects.len()];
         for (i, obj) in self.objects.iter().enumerate() {
             offsets[i] = out.len();
