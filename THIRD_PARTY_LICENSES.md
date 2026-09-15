@@ -38,3 +38,25 @@ zlib / DEFLATE 圧縮に [`miniz_oxide`](https://github.com/Frommi/miniz_oxide) 
 
 - ライセンス: 0BSD、MIT、または Apache-2.0
 - [配布物](https://crates.io/crates/adler2/2.0.1)のライセンス本文と著作権表示を保持してください。
+
+## subsetter 0.2.6
+
+`--font` で指定されたTrueTypeフォントを、PDFで使用するグリフだけに
+サブセット化するために使用しています。
+
+- ライセンス: MIT または Apache-2.0
+- [配布物](https://crates.io/crates/subsetter/0.2.6)のライセンス本文と著作権表示を保持してください。
+
+### rustc-hash 2.1.3
+
+`rustc-hash` は `subsetter` が使用する間接依存です。
+
+- ライセンス: MIT または Apache-2.0
+- [配布物](https://crates.io/crates/rustc-hash/2.1.3)のライセンス本文と著作権表示を保持してください。
+
+## フォントファイル
+
+本プロジェクトはフォントファイルを同梱・再配布しません。`--font` で指定した
+フォントは出力PDFに埋め込まれるため、そのフォントのライセンスが埋め込みと
+PDFの再配布を許可しているかを利用者が確認してください。サブセット化後も、
+フォントに含まれる著作権情報は保持されます。

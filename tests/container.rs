@@ -819,6 +819,11 @@ fn a_japanese_note_always_comes_with_a_line_any_reader_can_draw() {
     // Both faces are declared and both are used.
     assert!(text.contains("/Subtype /Type0"), "no Japanese font");
     assert!(text.contains("/UniJIS-UCS2-H"));
+    assert!(text.contains("/BaseFont /HeiseiMin-W3"));
+    assert!(
+        !text.contains("/FontFile2"),
+        "default output embedded a font"
+    );
     assert!(text.contains("/BaseFont /Helvetica"), "no fallback font");
     assert!(text.contains("/FJ ") && text.contains("/FA "));
     // The Japanese line is a hex string; the fallback is a literal one.

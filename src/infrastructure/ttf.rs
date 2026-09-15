@@ -13,7 +13,7 @@ fn u32_at(d: &[u8], at: usize) -> Option<u32> {
 
 /// 埋め込みに必要な範囲だけを解析したTrueTypeフォント。
 pub struct Font {
-    /// PDFへそのまま格納するフォント全体。
+    /// フォントの元データ。PDFへは使用グリフのサブセットだけを格納する。
     pub data: Vec<u8>,
     /// 1emあたりのデザイン単位数。
     pub units_per_em: u16,

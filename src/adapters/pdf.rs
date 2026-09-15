@@ -13,7 +13,7 @@ use crate::domain::rendering::{
     self, Fill, Image, Metafile, Raster, Rect, Segment, Shape, Source, Text,
 };
 use crate::domain::Document;
-use crate::infrastructure::{jpeg, ttf, LzhMetafileDecoder, MagicAttachmentScanner};
+use crate::infrastructure::{deflate, jpeg, ttf, LzhMetafileDecoder, MagicAttachmentScanner};
 
 /// How to treat pages whose image cannot be recovered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,12 +33,12 @@ pub struct Options {
     /// metafile inside. On by default: it is the difference between a page of
     /// searchable text and an apology.
     pub decode: bool,
-    /// A TrueType font to embed for the recovered page text.
+    /// A TrueType font supplied by the caller for the recovered page text.
     ///
     /// Without one the PDF names a standard Japanese face and relies on the
-    /// reader having it, which is how Japanese PDFs have always been written
-    /// but leaves nothing to render on a machine without those fonts. With one,
-    /// the document carries its own text and reads the same everywhere.
+    /// reader having it, which keeps the output small. With one, only the
+    /// glyphs used in the document are embedded, so the caller's font license
+    /// must permit embedding and redistribution in the resulting PDF.
     pub font: Option<std::sync::Arc<ttf::Font>>,
     /// Include preview entries as pages. Off by default: they are low
     /// resolution copies of other pages, not content.
@@ -394,6 +394,16 @@ where
     // its body written at the end.
     let embedded = opts.font.as_ref().map(|_| w.reserve());
     let mut used_glyphs: BTreeMap<u16, char> = BTreeMap::new();
+    let mut glyph_widths: BTreeMap<u16, u16> = BTreeMap::new();
+    // The PDF text operands use the remapped IDs from the subset. Validate the
+    // font once before drawing so a font that the subsetter cannot read falls
+    // back to full-font embedding without invalidating those IDs.
+    let mut glyph_remapper = opts.font.as_ref().and_then(|font| {
+        let remapper = subsetter::GlyphRemapper::new();
+        subsetter::subset(&font.data, 0, &remapper)
+            .ok()
+            .map(|_| remapper)
+    });
     let mut kids: Vec<usize> = Vec::new();
     // (object id, original page number) for each page that is only a marker.
     let mut gaps: Vec<(usize, usize)> = Vec::new();
@@ -454,6 +464,8 @@ where
                         &mut xobjects,
                         opts.font.as_deref(),
                         &mut used_glyphs,
+                        &mut glyph_widths,
+                        &mut glyph_remapper,
                     )
                 } else {
                     Drawn {
@@ -558,6 +570,8 @@ where
                     &mut xobjects,
                     opts.font.as_deref(),
                     &mut used_glyphs,
+                    &mut glyph_widths,
+                    &mut glyph_remapper,
                 );
                 let over = draw_overlays(
                     &mut w,
@@ -571,6 +585,8 @@ where
                     &mut xobjects,
                     opts.font.as_deref(),
                     &mut used_glyphs,
+                    &mut glyph_widths,
+                    &mut glyph_remapper,
                 );
                 let (glyphs, placed) = (drawn.glyphs + over.glyphs, drawn.pictures + over.pictures);
                 let fonts = match embedded {
@@ -650,8 +666,19 @@ where
                 id,
                 "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
             );
+        } else if let Some(remapper) = glyph_remapper.as_ref() {
+            for old_gid in remapper.remapped_gids() {
+                if let Some(new_gid) = remapper.get(old_gid) {
+                    glyph_widths
+                        .entry(new_gid)
+                        .or_insert_with(|| font.width(old_gid));
+                }
+            }
+            let subset = subsetter::subset(&font.data, 0, remapper)
+                .expect("font was validated before PDF drawing");
+            embed_font(&mut w, id, font, &subset, &used_glyphs, &glyph_widths);
         } else {
-            embed_font(&mut w, id, font, &used_glyphs);
+            embed_font(&mut w, id, font, &font.data, &used_glyphs, &glyph_widths);
         }
     }
 
@@ -777,7 +804,7 @@ where
 /// The fonts a placeholder note may need: always Helvetica, plus a Japanese
 /// face when one is asked for.
 ///
-/// The Japanese face is a character collection rather than an embedded font,
+/// The Japanese face is a standard character collection rather than an embedded font,
 /// which keeps the file small but leaves the glyphs to the reader. Readers
 /// without the mapping installed draw nothing at all for them, so a Japanese
 /// note is always accompanied by a plain line that every reader can show. A
@@ -799,8 +826,8 @@ fn note_fonts(
         Lang::English => None,
         Lang::Japanese => {
             let descendant = w.add(
-                "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /KozMinPro-Regular-Acro \
-                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >> \
+                "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /HeiseiMin-W3 \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 4 >> \
                  /DW 1000 >>"
                     .to_string(),
             );
@@ -819,7 +846,7 @@ fn note_fonts(
                   endcmap CMapName currentdict /CMap defineresource pop end end",
             );
             Some(w.add(format!(
-                "<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPro-Regular-Acro \
+                "<< /Type /Font /Subtype /Type0 /BaseFont /HeiseiMin-W3 \
                  /Encoding /UniJIS-UCS2-H /DescendantFonts [{descendant} 0 R] \
                  /ToUnicode {to_unicode} 0 R >>"
             )))
@@ -899,8 +926,19 @@ fn width_em(s: &str) -> f32 {
 /// The font is keyed by glyph index, so the text operand carries glyph indices
 /// and a ToUnicode map carries the characters back. That combination renders
 /// and copies correctly in any reader, with nothing installed.
-fn embed_font(w: &mut Writer, id: usize, font: &ttf::Font, used: &BTreeMap<u16, char>) {
-    let file = w.add_stream(format!("<< /Length1 {} >>", font.data.len()), &font.data);
+fn embed_font(
+    w: &mut Writer,
+    id: usize,
+    font: &ttf::Font,
+    data: &[u8],
+    used: &BTreeMap<u16, char>,
+    glyph_widths: &BTreeMap<u16, u16>,
+) {
+    let compressed = deflate::zlib(data);
+    let file = w.add_stream(
+        format!("<< /Length1 {} /Filter /FlateDecode >>", data.len()),
+        &compressed,
+    );
     let descriptor = w.add(format!(
         "<< /Type /FontDescriptor /FontName /{} /Flags 4 /FontBBox [-1000 -1000 2000 2000] \
          /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 \
@@ -932,7 +970,7 @@ fn embed_font(w: &mut Writer, id: usize, font: &ttf::Font, used: &BTreeMap<u16, 
             flush(&mut widths, run_start, &mut run);
             run_start = Some(gid);
         }
-        run.push(font.width(gid));
+        run.push(glyph_widths.get(&gid).copied().unwrap_or(1000));
         prev = Some(gid);
     }
     flush(&mut widths, run_start, &mut run);
@@ -1022,6 +1060,8 @@ fn draw_page(
     xobjects: &mut String,
     font: Option<&ttf::Font>,
     used: &mut BTreeMap<u16, char>,
+    glyph_widths: &mut BTreeMap<u16, u16>,
+    remapper: &mut Option<subsetter::GlyphRemapper>,
 ) -> Drawn {
     let mut drawn = Drawn {
         glyphs: 0,
@@ -1247,7 +1287,19 @@ fn draw_page(
             }
             Item::Text(t) => {
                 set_clip(out, (None, None), &mut clip_open, &mut fill_colour);
-                drawn.glyphs += draw_text(t, px, py, uy, fit, out, font, used, &mut fill_colour);
+                drawn.glyphs += draw_text(
+                    t,
+                    px,
+                    py,
+                    uy,
+                    fit,
+                    out,
+                    font,
+                    used,
+                    glyph_widths,
+                    remapper,
+                    &mut fill_colour,
+                );
             }
         }
     }
@@ -1273,6 +1325,8 @@ fn draw_overlays<D: PageDecoder + ?Sized>(
     xobjects: &mut String,
     font: Option<&ttf::Font>,
     used: &mut BTreeMap<u16, char>,
+    glyph_widths: &mut BTreeMap<u16, u16>,
+    remapper: &mut Option<subsetter::GlyphRemapper>,
 ) -> Drawn {
     const PT: f32 = 72.0 / 2540.0;
     let mut total = Drawn {
@@ -1313,6 +1367,8 @@ fn draw_overlays<D: PageDecoder + ?Sized>(
             xobjects,
             font,
             used,
+            glyph_widths,
+            remapper,
         );
         total.glyphs += d.glyphs;
         total.pictures += d.pictures;
@@ -1416,6 +1472,8 @@ fn draw_text(
     out: &mut String,
     font: Option<&ttf::Font>,
     used: &mut BTreeMap<u16, char>,
+    glyph_widths: &mut BTreeMap<u16, u16>,
+    remapper: &mut Option<subsetter::GlyphRemapper>,
     fill_colour: &mut Option<(u8, u8, u8)>,
 ) -> usize {
     let size = (t.size / uy) * fit;
@@ -1449,8 +1507,12 @@ fn draw_text(
         match font {
             // With a font of our own, the operand is a glyph index.
             Some(f) => match f.glyph(*ch) {
-                Some(gid) => {
+                Some(old_gid) => {
+                    let gid = remapper
+                        .as_mut()
+                        .map_or(old_gid, |mapper| mapper.remap(old_gid));
                     used.insert(gid, *ch);
+                    glyph_widths.insert(gid, f.width(old_gid));
                     hex.push_str(&format!("{gid:04X}"));
                 }
                 None => continue,
