@@ -304,6 +304,45 @@ fn close_group(pages: &mut [Page], group: &[usize], after_thumbnail: bool) {
         }
         return;
     }
+
+    // A nested kind-5 JPEG carries its paper size in the page body.  It is a
+    // complete image page, not one of the paperless JPEG entries that a
+    // printer driver stores as artwork beside a coded sheet.  When several
+    // such pages are consecutive (some writers omit the thumbnail between
+    // them), treating the largest one as the sheet would append every later
+    // page to the first and would also make the artwork contact-sheet layout
+    // rotate it to fit.  Honour the explicit page geometry as a boundary and
+    // leave only paperless images to the artwork heuristic below.
+    let explicit_image_sheets: Vec<usize> = group
+        .iter()
+        .copied()
+        .filter(|&i| matches!(pages[i].data, PageData::Jpeg { .. }) && pages[i].paper.is_some())
+        .collect();
+    if !explicit_image_sheets.is_empty() {
+        let mut current: Option<usize> = None;
+        for &i in group {
+            let is_sheet = explicit_image_sheets.contains(&i) || !is_picture(&pages[i]);
+            if is_sheet {
+                pages[i].role = Role::Sheet;
+                pages[i].belongs_to = None;
+                current = Some(pages[i].index);
+            } else {
+                pages[i].role = Role::Picture;
+                pages[i].belongs_to = current;
+            }
+        }
+        let owner = explicit_image_sheets
+            .first()
+            .copied()
+            .map(|i| pages[i].index);
+        for &i in group {
+            if pages[i].role == Role::Picture && pages[i].belongs_to.is_none() {
+                pages[i].belongs_to = owner;
+            }
+        }
+        return;
+    }
+
     // コンテナは本文とその上の画像を順に書く。本文より前の画像は、本文に
     // 配置された画像ではなく、画像からインポートされた本文として扱う。
     let first_coded = group.iter().position(|&i| !is_picture(&pages[i]));

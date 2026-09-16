@@ -266,6 +266,38 @@ fn nested_kind5_jpeg_is_recoverable() {
 }
 
 #[test]
+fn consecutive_kind5_jpegs_remain_separate_pages() {
+    let first = tiny_jpeg(600, 800);
+    let second = tiny_jpeg(700, 500);
+    let file = container(
+        10,
+        0x68,
+        vec![kind5_jpeg_page(600, 800), kind5_jpeg_page(700, 500)],
+        &[],
+    );
+    let doc = parse(&file).expect("parses");
+
+    assert_eq!(doc.sheets().count(), 2);
+    assert!(doc
+        .pages
+        .iter()
+        .all(|p| p.role == xdw_salvage::domain::Role::Sheet));
+    assert!(doc.pages.iter().all(|p| p.belongs_to.is_none()));
+
+    let (bytes, report) = pdf::build(&file, &doc, pdf::Options::default());
+    assert_eq!(report.embedded, 2);
+    assert_eq!(report.pictures_placed, 0);
+    let pdf_text = String::from_utf8_lossy(&bytes);
+    assert!(pdf_text.contains("/Count 2"));
+    assert!(
+        !pdf_text.contains("0 1 -1 0"),
+        "the second page was still laid out as a rotated artwork block"
+    );
+    assert!(bytes.windows(first.len()).any(|w| w == first.as_slice()));
+    assert!(bytes.windows(second.len()).any(|w| w == second.as_slice()));
+}
+
+#[test]
 fn older_generation_uses_its_own_trailer_tag() {
     let file = container(7, 0x65, vec![jpeg_page(100, 100)], &[]);
     let doc = parse(&file).expect("parses");
