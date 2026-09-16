@@ -1,10 +1,12 @@
 //! 文書プロパティブロック（展開後）からページごとの表示属性を読む。
 //!
-//! The block is a flat run of `0x62` records. Each carries a level byte
-//! (tag `0x80`): 2 opens a page, 3 gives a child dimension, 4 is the page's
-//! own record or, later in the run, an annotation on it. Tags are BER style:
-//! a first byte whose low five bits are all set is followed by continuation
-//! bytes. Values are lists of length-prefixed big-endian integers.
+//! The block is a run of `0x62` records. Each carries a level byte (tag
+//! `0x80`): 2 opens a page, 3 gives a child dimension, 4 is the page's own
+//! record or, later in the run, an annotation on it. Older writers wrap the
+//! child fields in another `0x62` record, so field lookup descends through
+//! those metadata wrappers. Tags are BER style: a first byte whose low five
+//! bits are all set is followed by continuation bytes. Values are lists of
+//! length-prefixed big-endian integers.
 
 use crate::domain::page::{Overlay, PagePlacement};
 use crate::infrastructure::tlv;
@@ -25,6 +27,10 @@ const LEVEL_CONTENT: u64 = 4;
 const D_KIND: u8 = 0x80;
 const D_EXPANDED: u8 = 0x81;
 const D_DATA: u8 = 0x86;
+// A public GDI comment can carry a bare Group 4 image instead of an LZH
+// drawing.  These are the image dimensions inside that drawing element.
+const D_PIXEL_WIDTH: u8 = 0x87;
+const D_PIXEL_HEIGHT: u8 = 0x88;
 
 /// What the properties say about how one page is shown.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -54,13 +60,11 @@ pub fn pages(block: &[u8]) -> Vec<PageInfo> {
         if tag != [RECORD] {
             continue;
         }
-        let fields: Vec<(Vec<u8>, &[u8])> = elements(value).collect();
-        let field = |want: &[u8]| fields.iter().find(|(t, _)| t == want).map(|(_, v)| *v);
-        let level = field(LEVEL).and_then(uint);
+        let level = direct_field(value, LEVEL).and_then(uint);
         match level {
             Some(LEVEL_PAGE) => {
                 out.push(PageInfo {
-                    paper: field(PAPER).and_then(pair),
+                    paper: find_field(value, PAPER).and_then(pair),
                     rotation: 0,
                     overlays: Vec::new(),
                     placements: Vec::new(),
@@ -70,8 +74,8 @@ pub fn pages(block: &[u8]) -> Vec<PageInfo> {
             }
             Some(LEVEL_CHILD) => {
                 child = match (
-                    field(CHILD_POSITION).and_then(position),
-                    field(CHILD_SIZE).and_then(pair),
+                    find_field(value, CHILD_POSITION).and_then(position),
+                    find_field(value, CHILD_SIZE).and_then(pair),
                 ) {
                     (Some((x, y)), Some((w, h))) => Some((x, y, w, h)),
                     _ => None,
@@ -87,11 +91,13 @@ pub fn pages(block: &[u8]) -> Vec<PageInfo> {
                 let area = child.take();
                 if expecting_content {
                     expecting_content = false;
-                    if let Some(r) = field(ROTATION).and_then(|v| ints(v).first().copied()) {
+                    if let Some(r) =
+                        find_field(value, ROTATION).and_then(|v| ints(v).first().copied())
+                    {
                         page.rotation = (r % 360) as u16;
                     }
                 }
-                if let Some(o) = field(DRAWING).and_then(|v| drawing(v, area)) {
+                if let Some(o) = find_field(value, DRAWING).and_then(|v| drawing(v, area)) {
                     // An annotation (or a page-owned drawing): its drawing
                     // sits in the box the child record before it announced.
                     page.overlays.push(o);
@@ -102,7 +108,7 @@ pub fn pages(block: &[u8]) -> Vec<PageInfo> {
                     // a run of unrelated small pages.
                     page.placements.push(PagePlacement {
                         area,
-                        frame: field(PAPER).and_then(pair),
+                        frame: find_field(value, PAPER).and_then(pair),
                     });
                 }
             }
@@ -114,19 +120,62 @@ pub fn pages(block: &[u8]) -> Vec<PageInfo> {
 
 /// A drawing element: kind, expanded length and coded bytes.
 fn drawing(v: &[u8], area: Option<(u32, u32, u32, u32)>) -> Option<Overlay> {
-    let fields = tlv::read_window(v, 0, v.len()).ok()?;
-    let kind = tlv::find_uint(&fields, v, D_KIND)?;
-    let expanded = tlv::find_uint(&fields, v, D_EXPANDED)?;
-    let data = tlv::find(&fields, D_DATA)?;
-    if expanded == 0 || expanded > 1 << 28 {
-        return None;
-    }
+    let kind = find_field(v, &[D_KIND]).and_then(uint)?;
+    let data = find_field(v, &[D_DATA])?;
+    let expanded = find_field(v, &[D_EXPANDED]).and_then(uint);
+    let pixels = if kind == 9 {
+        Some((
+            u32::try_from(find_field(v, &[D_PIXEL_WIDTH]).and_then(uint)?).ok()?,
+            u32::try_from(find_field(v, &[D_PIXEL_HEIGHT]).and_then(uint)?).ok()?,
+        ))
+    } else {
+        None
+    };
+    let expanded = match expanded {
+        Some(value) if value > 0 && value <= 1 << 28 => value as usize,
+        // Group 4 is a standard one-bit stream and deliberately has no LZH
+        // expanded-length field.  Its decoder uses the recorded pixel size.
+        None if kind == 9 && pixels.is_some() => 0,
+        _ => return None,
+    };
     Some(Overlay {
         kind,
-        expanded: expanded as usize,
-        coded: data.bytes(v).to_vec(),
+        expanded,
+        coded: data.to_vec(),
+        pixels,
         area,
     })
+}
+
+/// Find a field in a record, including the small nested `0x62` metadata
+/// record used by older DocuWorks writers.  The top-level properties reader
+/// intentionally remains a stream parser; only field lookup needs to descend
+/// into that metadata wrapper.
+fn find_field<'a>(value: &'a [u8], want: &[u8]) -> Option<&'a [u8]> {
+    find_field_at_depth(value, want, 0)
+}
+
+fn find_field_at_depth<'a>(value: &'a [u8], want: &[u8], depth: usize) -> Option<&'a [u8]> {
+    if depth > 8 {
+        return None;
+    }
+    for (tag, field) in elements(value) {
+        if tag == want {
+            return Some(field);
+        }
+        if tag == [RECORD] {
+            if let Some(found) = find_field_at_depth(field, want, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn direct_field<'a>(value: &'a [u8], want: &[u8]) -> Option<&'a [u8]> {
+    elements(value)
+        .find(|(tag, _)| tag == want)
+        .map(|(_, field)| field)
 }
 
 /// Walk the tag/length/value elements of `d`, with BER-style long tags.
@@ -300,6 +349,49 @@ mod tests {
                 frame: Some((500, 600)),
             }]
         );
+    }
+
+    #[test]
+    fn nested_child_and_group4_drawing_keep_their_position_and_pixels() {
+        let field = |tag: &[u8], value: &[u8]| {
+            let mut v = tag.to_vec();
+            v.push(value.len() as u8);
+            v.extend_from_slice(value);
+            v
+        };
+        let pair = |a: u16, b: u16| {
+            let mut v = Vec::new();
+            v.push(2);
+            v.extend_from_slice(&a.to_be_bytes());
+            v.push(2);
+            v.extend_from_slice(&b.to_be_bytes());
+            v
+        };
+        let child_metadata = record(&[
+            &field(CHILD_POSITION, &pair(1000, 1800)),
+            &field(CHILD_SIZE, &pair(2142, 2142)),
+        ]);
+        let drawing_fields = [
+            field(&[D_KIND], &[9]),
+            field(&[D_PIXEL_WIDTH], &[81]),
+            field(&[D_PIXEL_HEIGHT], &[81]),
+            field(&[D_DATA], &[0xAA, 0xBB]),
+        ]
+        .concat();
+        let drawing = field(DRAWING, &drawing_fields);
+        let mut block = record(&[&[0x80, 1, 2]]);
+        block.extend(record(&[&[0x80, 1, 3], &child_metadata]));
+        block.extend(record(&[&[0x80, 1, 4], &drawing]));
+
+        let parsed = pages(&block);
+
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].placements.is_empty());
+        assert_eq!(parsed[0].overlays.len(), 1);
+        assert_eq!(parsed[0].overlays[0].kind, 9);
+        assert_eq!(parsed[0].overlays[0].pixels, Some((81, 81)));
+        assert_eq!(parsed[0].overlays[0].coded, vec![0xAA, 0xBB]);
+        assert_eq!(parsed[0].overlays[0].area, Some((1000, 1800, 2142, 2142)));
     }
 
     #[test]

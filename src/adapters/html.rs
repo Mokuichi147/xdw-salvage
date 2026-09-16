@@ -125,7 +125,7 @@ where
             {
                 continue;
             }
-            let Some(meta) = recovery::decode_page(data, label, decoder) else {
+            let Some(meta) = recovery::decode_page_for_document(data, label, doc, decoder) else {
                 continue;
             };
             if serial_label(&meta) {
@@ -170,7 +170,7 @@ where
             no += 1;
             let decoded = opts
                 .decode
-                .then(|| recovery::decode_page(data, p, decoder))
+                .then(|| recovery::decode_page_for_document(data, p, doc, decoder))
                 .flatten();
             // A picture page with a drawing of its own is drawn from that
             // drawing, which places the picture and whatever sits over it.
@@ -239,7 +239,7 @@ where
                 // text rather than a note saying it could not be read. A sheet
                 // that does not expand falls through to the arm below, which still
                 // shows whatever artwork sits on it.
-                PageData::Encoded { .. } if decoded.is_some() => {
+                PageData::Encoded { .. } | PageData::Preview { .. } if decoded.is_some() => {
                     let m = decoded.as_ref().expect("decoded guard above");
                     report.embedded += 1;
                     if let Some((placed, drawn)) =
@@ -1075,8 +1075,9 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
                 pictures += 1;
                 recovered = true;
             }
-            PageData::Encoded { .. } if decode => {
-                let Some(meta) = recovery::decode_page(data, page, decoder) else {
+            PageData::Encoded { .. } | PageData::Preview { .. } if decode => {
+                let Some(meta) = recovery::decode_page_for_document(data, page, doc, decoder)
+                else {
                     continue;
                 };
                 let stored: Vec<&Page> = doc.pictures_on(page.index).collect();
@@ -1135,6 +1136,12 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
                 recovered |= g > 0 || d > 0;
             }
         }
+    }
+
+    // The properties stream can explicitly retain a blank logical page even
+    // when the page table has no body to attach to it.
+    if display.members.is_empty() && display.overlays.is_empty() {
+        recovered = true;
     }
 
     if !recovered && svg.is_empty() && spans.is_empty() {
@@ -1353,6 +1360,7 @@ mod tests {
                     kind: 1,
                     expanded: 1,
                     coded: Vec::new(),
+                    pixels: None,
                     area: None,
                 }],
                 data: PageData::Bare { offset: 0, len: 0 },

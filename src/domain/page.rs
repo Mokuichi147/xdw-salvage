@@ -32,8 +32,11 @@ pub enum PageData {
         stored: u32,
         expanded: u32,
         rows: u32,
+        /// Preview compression method from the sub-header.
+        method: u32,
     },
-    /// ページメタデータを伴う独自圧縮データ。対応コーデックなしでは復元できない。
+    /// ページメタデータを伴う符号化データ。kind 9 の裸の Group 4 画像の
+    /// ように、`aux_len` がなくても本体固有の復号器で扱える場合がある。
     Encoded {
         offset: usize,
         len: usize,
@@ -64,6 +67,9 @@ pub struct Overlay {
     pub expanded: usize,
     /// 独自圧縮されたままのデータ。
     pub coded: Vec<u8>,
+    /// 画像系の描画が持つ画素寸法。通常のメタファイルでは不要だが、
+    /// プロパティ内に裸の Group 4 画像を置く古い形式で使う。
+    pub pixels: Option<(u32, u32)>,
     /// 注釈の位置と大きさ（x, y, 幅, 高さ。100分の1ミリメートル単位）。
     /// `None` はページ全体に重なる。
     pub area: Option<(u32, u32, u32, u32)>,
@@ -119,7 +125,20 @@ pub struct Page {
 impl Page {
     /// このエントリ自身の画像を、コンテナのコーデックなしで書き出せるか。
     pub fn is_recoverable(&self) -> bool {
-        matches!(self.data, PageData::Jpeg { .. })
+        match self.data {
+            PageData::Jpeg { .. } | PageData::Encoded { kind_code: 9, .. } => true,
+            PageData::Preview { .. } => self.is_full_size_preview(),
+            _ => false,
+        }
+    }
+
+    /// Whether a preview entry carries a page-sized bitmap rather than a
+    /// thumbnail.  A few old documents store the page body in this form; its
+    /// pixel dimensions are the reliable discriminator because both entries
+    /// use the same kind code.
+    pub fn is_full_size_preview(&self) -> bool {
+        matches!(self.data, PageData::Preview { .. })
+            && self.pixels.is_some_and(|(w, h)| w >= 1000 && h >= 1000)
     }
 
     /// 本文ではなく、別の本文ページのサムネイルか。

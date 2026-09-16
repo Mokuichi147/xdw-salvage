@@ -108,20 +108,25 @@ const STANDARD_PAPERS_MM100: &[(u32, u32)] = &[
     (29_700, 42_000),
     (42_000, 29_700),
 ];
+const STANDARD_PAPER_TOLERANCE_MM100: u32 = 100;
 
 /// Convert an XDW paper size to the PDF page grid used by the reference
 /// printouts.  Windows print drivers describe a page in 600-dpi device units,
 /// so using the mathematically exact millimetre conversion leaves a visible
-/// metadata difference such as 595.28 versus 595.32 points.  Scanned JPEG
-/// bounds can also be a few hundredths of a millimetre short of a standard
-/// sheet; recognise only that narrow case and keep arbitrary paper sizes
-/// unchanged.
+/// metadata difference such as 595.28 versus 595.32 points. Scanned JPEG
+/// bounds can be as much as about a millimetre short of a standard sheet
+/// because the stored frame follows the 300-dpi image extent rather than the
+/// printable paper edge. Recognise only that narrow case and keep arbitrary
+/// paper sizes unchanged.
 fn pdf_paper_points(paper: Option<(u32, u32)>) -> Option<(f32, f32)> {
     paper.map(|(w, h)| {
         let (w, h) = STANDARD_PAPERS_MM100
             .iter()
             .copied()
-            .find(|(sw, sh)| w.abs_diff(*sw) <= 10 && h.abs_diff(*sh) <= 10)
+            .find(|(sw, sh)| {
+                w.abs_diff(*sw) <= STANDARD_PAPER_TOLERANCE_MM100
+                    && h.abs_diff(*sh) <= STANDARD_PAPER_TOLERANCE_MM100
+            })
             .unwrap_or((w, h));
         let to_points = |mm100: u32| {
             let device = (mm100 as f64 * 600.0 / 2540.0).round();
@@ -548,7 +553,7 @@ where
             {
                 continue;
             }
-            let Some(meta) = recovery::decode_page(data, label, decoder) else {
+            let Some(meta) = recovery::decode_page_for_document(data, label, doc, decoder) else {
                 continue;
             };
             if serial_label(&meta) {
@@ -655,7 +660,7 @@ where
             };
             let decoded = opts
                 .decode
-                .then(|| recovery::decode_page(data, p, decoder))
+                .then(|| recovery::decode_page_for_document(data, p, doc, decoder))
                 .flatten();
             match &p.data {
                 PageData::Jpeg { offset, len } => {
@@ -841,7 +846,7 @@ where
                 // The sheet is in the container's own coding. Expand it: what comes
                 // out is a metafile, and its text is real text with real positions,
                 // so the page can be redrawn rather than apologised for.
-                PageData::Encoded { .. } if decoded.is_some() => {
+                PageData::Encoded { .. } | PageData::Preview { .. } if decoded.is_some() => {
                     let meta = decoded.as_ref().expect("decoded guard above");
                     let (nw, nh) = meta.points();
                     let (pw, ph) = opts
@@ -1509,11 +1514,29 @@ struct PdfMatrix {
 /// PDFの用紙向きが逆になり、内容も縮小されるため、局所座標系で描いてから
 /// 最終ページへ回転配置する。
 fn oriented_place(place: Place, meta: &Metafile, rotation: u16) -> (Place, Option<PdfMatrix>) {
+    oriented_content_place(place, meta.points(), rotation)
+}
+
+/// Apply a displayed-page rotation to an image whose native frame is known in
+/// points. JPEG pages do not have a metafile to carry that frame, but they use
+/// the same local-coordinate transform as decoded vector/raster pages.
+fn oriented_image_place(
+    place: Place,
+    frame: (f32, f32),
+    rotation: u16,
+) -> (Place, Option<PdfMatrix>) {
+    oriented_content_place(place, frame, rotation)
+}
+
+fn oriented_content_place(
+    place: Place,
+    (sw, sh): (f32, f32),
+    rotation: u16,
+) -> (Place, Option<PdfMatrix>) {
     let rotation = rotation % 360;
     if rotation == 0 {
         return (place, None);
     }
-    let (sw, sh) = meta.points();
     if !(sw.is_finite() && sh.is_finite() && sw > 0.0 && sh > 0.0) {
         return (place, None);
     }
@@ -2033,6 +2056,7 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
                     data,
                     page,
                     place,
+                    display.rotation,
                     &format!("D{n}"),
                     &mut content,
                     &mut xobjects,
@@ -2040,8 +2064,8 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
                     recovered = true;
                 }
             }
-            PageData::Encoded { .. } if decode => {
-                if let Some(meta) = recovery::decode_page(data, page, decoder) {
+            PageData::Encoded { .. } | PageData::Preview { .. } if decode => {
+                if let Some(meta) = recovery::decode_page_for_document(data, page, doc, decoder) {
                     let stored = doc.pictures_on(page.index).collect::<Vec<_>>();
                     let mut member_content = String::new();
                     let mut member_xobjects = String::new();
@@ -2103,6 +2127,13 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
         }
     }
 
+    // Some printer exports preserve explicit blank logical pages in the
+    // properties stream while omitting a page-table body for them.  They are
+    // still real pages and must survive `--skip-missing` as blank sheets.
+    if display.members.is_empty() && display.overlays.is_empty() {
+        recovered = true;
+    }
+
     DisplayRender {
         content,
         xobjects,
@@ -2149,11 +2180,13 @@ fn area_place((x, y, w, h): (u32, u32, u32, u32), ph: f32) -> Place {
 }
 
 /// Embed a JPEG page body into an arbitrary displayed-page rectangle.
+#[allow(clippy::too_many_arguments)]
 fn draw_jpeg_at(
     w: &mut Writer,
     data: &[u8],
     page: &Page,
     place: Place,
+    rotation: u16,
     tag: &str,
     out: &mut String,
     xobjects: &mut String,
@@ -2183,11 +2216,21 @@ fn draw_jpeg_at(
     );
     let name = format!("{tag}Im");
     xobjects.push_str(&format!("/{name} {id} 0 R "));
-    let bottom = (place.ph - place.top - place.h).max(0.0);
-    out.push_str(&format!(
+    let (draw_place, matrix) = oriented_image_place(
+        place,
+        page.paper_points().unwrap_or((width as f32, height as f32)),
+        rotation,
+    );
+    let bottom = (draw_place.ph - draw_place.top - draw_place.h).max(0.0);
+    let body = format!(
         "q {:.2} 0 0 {:.2} {:.2} {:.2} cm /{name} Do Q\n",
-        place.w, place.h, place.x, bottom
-    ));
+        draw_place.w, draw_place.h, draw_place.x, bottom
+    );
+    if let Some(matrix) = matrix {
+        append_matrix(out, matrix, &body);
+    } else {
+        out.push_str(&body);
+    }
     true
 }
 
@@ -2836,6 +2879,10 @@ mod tests {
         let near_a4 = pdf_paper_points(Some((20_997, 29_692))).expect("near A4");
         assert!((near_a4.0 - 595.32).abs() < 0.01);
         assert!((near_a4.1 - 841.92).abs() < 0.01);
+
+        let image_frame_a4 = pdf_paper_points(Some((20_928, 29_672))).expect("image-frame A4");
+        assert!((image_frame_a4.0 - 595.32).abs() < 0.01);
+        assert!((image_frame_a4.1 - 841.92).abs() < 0.01);
 
         let custom = pdf_paper_points(Some((10_000, 14_800))).expect("custom");
         assert!((custom.0 - 283.44).abs() < 0.01);

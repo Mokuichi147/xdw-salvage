@@ -29,6 +29,8 @@ const B_JPEG_Y_RESOLUTION: u8 = 0x8C;
 const KIND_PREVIEW: u64 = 7;
 // ネストされた kind 5 のJPEGページ。
 const KIND_JPEG: u64 = 5;
+// 古い画像ページで使われる、裸の CCITT Group 4 (T.6) ストリーム。
+const KIND_GROUP4: u64 = 9;
 
 // kind 5 のJPEGページに付随する補助属性。値の意味はこの判定には不要で、
 // 既知のページ属性として扱える。
@@ -86,7 +88,7 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
             B_PIXEL_W,
             B_PIXEL_H,
         ];
-        if kind_code == KIND_JPEG {
+        if matches!(kind_code, KIND_JPEG | KIND_GROUP4) {
             known_fields.extend_from_slice(KIND_JPEG_EXTRA_FIELDS);
         }
         unknown_fields.extend(unknown(&f, &known_fields));
@@ -113,6 +115,17 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
                     pixels = Some((w, h));
                 }
             }
+        } else if kind_code == KIND_GROUP4 {
+            // Group 4 pages use the same image-size fields as kind 5 JPEG
+            // pages, but carry the compressed bits without a JPEG header.
+            if let (Some(w), Some(h)) = (
+                tlv::find_uint(&f, data, B_JPEG_WIDTH),
+                tlv::find_uint(&f, data, B_JPEG_HEIGHT),
+            ) {
+                if let (Ok(w), Ok(h)) = (u32::try_from(w), u32::try_from(h)) {
+                    pixels = Some((w, h));
+                }
+            }
         }
         let aux_len = tlv::find_uint(&f, data, B_AUX);
         let img = tlv::find(&f, B_DATA);
@@ -125,7 +138,8 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
                 if w > 0 {
                     pixels = Some((w, h));
                 }
-                let (stored, expanded, rows) = sub_header(d, pixels_at).unwrap_or((0, 0, 0));
+                let (method, stored, expanded, rows) =
+                    sub_header(d, pixels_at).unwrap_or((0, 0, 0, 0));
                 PageData::Preview {
                     offset: img.value,
                     len: img.len,
@@ -135,6 +149,7 @@ pub fn read(data: &[u8], index: usize, offset: usize) -> Result<Page> {
                     stored,
                     expanded,
                     rows,
+                    method,
                 }
             }
             (KIND_JPEG, Some(img)) if img.bytes(data).starts_with(&[0xFF, 0xD8]) => {
@@ -317,10 +332,10 @@ fn bitmap_header(d: &[u8]) -> Option<(u32, u32, u16, u32)> {
 }
 
 /// パレット末尾にあるサブヘッダーから格納長・展開長・行数を読む。
-fn sub_header(d: &[u8], at: usize) -> Option<(u32, u32, u32)> {
+fn sub_header(d: &[u8], at: usize) -> Option<(u32, u32, u32, u32)> {
     if at + 16 > d.len() {
         return None;
     }
     let u32le = |i: usize| u32::from_le_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]]);
-    Some((u32le(at + 4), u32le(at + 8), u32le(at + 12)))
+    Some((u32le(at), u32le(at + 4), u32le(at + 8), u32le(at + 12)))
 }

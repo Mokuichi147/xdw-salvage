@@ -28,6 +28,18 @@ pub trait AttachmentScanner {
 pub trait PageDecoder {
     fn decode(&self, data: &[u8], page: &Page) -> Option<Metafile>;
 
+    /// Recover a page when its neighbouring entries are needed to complete
+    /// an old storage form.  Decoders that do not need document context use
+    /// the ordinary page method unchanged.
+    fn decode_with_document(
+        &self,
+        data: &[u8],
+        page: &Page,
+        _document: &Document,
+    ) -> Option<Metafile> {
+        self.decode(data, page)
+    }
+
     /// Recover the drawing laid over a page, when the adapter understands
     /// its storage format. `paper` is the page's paper in hundredths of a
     /// millimetre, for overlays that cover the whole page.

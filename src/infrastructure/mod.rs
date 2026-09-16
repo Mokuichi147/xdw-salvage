@@ -1,6 +1,7 @@
 //! Concrete adapters for the application ports.
 
 pub mod attachments;
+pub mod ccitt;
 pub mod cp932;
 pub mod deflate;
 pub mod dib;

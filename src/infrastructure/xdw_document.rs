@@ -156,6 +156,15 @@ pub fn parse(data: &[u8]) -> Result<Document> {
     }
 
     let display_pages = apply_display_layout(&mut pages, &shown);
+    // Some saved-over documents leave a paper-sized, body-less page in the
+    // page table for a stamp or another properties-only annotation.  It is
+    // not a logical page of its own: the following recoverable body is the
+    // page on which the annotation was placed.  Only apply this conservative
+    // repair when the properties hierarchy was not usable, because a trusted
+    // composed display page already carries its annotations explicitly.
+    if display_pages.is_empty() {
+        merge_orphan_overlay_sheets(&mut pages);
+    }
 
     let (generations_present, unknown_tags) = survey(data);
 
@@ -178,6 +187,44 @@ pub fn parse(data: &[u8]) -> Result<Document> {
         unknown_tags,
         rebuilt,
     })
+}
+
+/// Move a properties-only annotation sheet onto the following page body.
+///
+/// A few old writers materialise an annotation as a `Bare` sheet between two
+/// ordinary page-table entries.  Emitting that entry as a page produces a
+/// stamp on an otherwise blank sheet and shifts every later page number.  The
+/// body-less entry is safe to merge only when its paper and rotation agree
+/// with the next recoverable sheet and it has no stored pictures of its own.
+fn merge_orphan_overlay_sheets(pages: &mut [Page]) {
+    let sheets: Vec<usize> = pages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, page)| page.is_sheet().then_some(index))
+        .collect();
+    for pair in sheets.windows(2) {
+        let [orphan, target] = *pair else { continue };
+        let is_orphan = matches!(pages[orphan].data, PageData::Bare { .. })
+            && !pages[orphan].overlays.is_empty()
+            && pages[orphan]
+                .paper
+                .zip(pages[target].paper)
+                .is_some_and(|((ow, oh), (tw, th))| {
+                    let close = |a: u32, b: u32| a.abs_diff(b) <= 100;
+                    (close(ow, tw) && close(oh, th)) || (close(ow, th) && close(oh, tw))
+                })
+            && pages[orphan].rotation % 360 == pages[target].rotation % 360
+            && !pages
+                .iter()
+                .any(|page| page.role == Role::Picture && page.belongs_to == Some(orphan));
+        if !is_orphan || !pages[target].is_recoverable() {
+            continue;
+        }
+        let overlays = std::mem::take(&mut pages[orphan].overlays);
+        pages[target].overlays.extend(overlays);
+        pages[orphan].role = Role::Data;
+        pages[orphan].belongs_to = None;
+    }
 }
 
 /// Apply the display hierarchy from the properties block to the page table.
@@ -204,6 +251,10 @@ fn apply_display_layout(
         .iter()
         .map(|info| info.placements.len())
         .sum::<usize>();
+    let single_placement_pages = shown
+        .iter()
+        .filter(|info| info.placements.len() == 1)
+        .count();
     let meaningful_sheets = sheet_indices
         .iter()
         .filter(|&&index| {
@@ -218,7 +269,12 @@ fn apply_display_layout(
     // pages than current page bodies, do not invent a repeated page layout.
     let trustworthy = shown.len() == sheet_indices.len()
         || (shown.len() == 1 && placements == sheet_indices.len())
-        || (shown.len() == 1 && placements > 0 && meaningful_sheets <= placements);
+        || (shown.len() == 1 && placements > 0 && meaningful_sheets <= placements)
+        // A QR/split-print export can retain explicit blank logical pages and
+        // place one current body on each of the remaining pages.  The page
+        // table alone cannot express those blanks, but this one-to-one
+        // placement pattern is unambiguous and matches the source order.
+        || (placements == sheet_indices.len() && single_placement_pages == placements);
     if !trustworthy {
         apply_page_attributes(pages, shown);
         return Vec::new();
@@ -245,7 +301,7 @@ fn apply_display_layout(
         // A normal one-sheet document can omit the child placement while its
         // properties still describe rotation and paper.  Keep that page in
         // the display model instead of making the layout appear empty.
-        if members.is_empty() {
+        if members.is_empty() && shown.len() == sheet_indices.len() {
             if let Some(&index) = sheet_indices
                 .iter()
                 .skip(fallback)
@@ -267,6 +323,14 @@ fn apply_display_layout(
             // paper belongs to `DisplayPage` and can be much larger for a
             // DocuMerge composition.
             page.overlays = info.overlays.clone();
+        }
+
+        // Saved-over documents can leave one trailing, attribute-less
+        // properties record behind.  It has neither a canvas nor a body and
+        // must not become a phantom blank output page.  Explicit blank pages
+        // retain their paper field and therefore remain in the display model.
+        if members.is_empty() && info.paper.is_none() && info.overlays.is_empty() {
+            continue;
         }
 
         result.push(DisplayPage {
@@ -442,17 +506,48 @@ fn assign_roles(pages: &mut [Page]) {
             after_thumbnail = false;
             continue;
         }
-        if matches!(pages[i].data, PageData::Preview { .. }) {
-            pages[i].role = Role::Thumbnail;
+        if pages[i].is_full_size_preview() {
+            // Some old image documents put a page-sized, method-5 preview
+            // between the preceding thumbnail and the next one.  It is the
+            // page body, not another thumbnail.  Close the preceding group
+            // before starting it so the following small preview attaches to
+            // this page.
+            close_group(pages, &group, false);
+            pages[i].role = Role::Sheet;
+            pages[i].belongs_to = None;
+            group.clear();
+            // Keep the body in the current group until its following
+            // thumbnail is seen.  Unlike an encoded body, this entry arrived
+            // on the preview branch itself, so clearing the group here would
+            // make the thumbnail owner impossible to discover.
+            group.push(i);
+            after_thumbnail = false;
+        } else if matches!(pages[i].data, PageData::Preview { .. }) {
+            // A small preview is normally the thumbnail belonging to the
+            // group immediately before it.  Some writers, however, omit the
+            // coded page body and leave only a standalone preview.  Decide
+            // which case this is after closing the preceding group; otherwise
+            // the standalone image is silently discarded as an orphaned
+            // thumbnail.
             close_group(pages, &group, false);
             let owner = group
                 .iter()
                 .rev()
                 .find(|&&k| pages[k].role == Role::Sheet)
                 .map(|&k| pages[k].index);
-            pages[i].belongs_to = owner;
+            if let Some(owner) = owner {
+                pages[i].role = Role::Thumbnail;
+                pages[i].belongs_to = Some(owner);
+                after_thumbnail = true;
+            } else {
+                // Do not put this page in `group`: two consecutive standalone
+                // previews must become two pages, not one page plus a
+                // thumbnail attached to the other.
+                pages[i].role = Role::Sheet;
+                pages[i].belongs_to = None;
+                after_thumbnail = false;
+            }
             group.clear();
-            after_thumbnail = true;
         } else {
             group.push(i);
         }
@@ -669,6 +764,85 @@ mod tests {
             data: PageData::Bare { offset: 0, len: 0 },
             unknown_fields: Vec::new(),
         }
+    }
+
+    fn preview(index: usize) -> Page {
+        Page {
+            index,
+            role: Role::Data,
+            belongs_to: None,
+            offset: 0,
+            checksum: None,
+            paper: None,
+            pixels: Some((160, 120)),
+            rotation: 0,
+            overlays: Vec::new(),
+            data: PageData::Preview {
+                offset: 0,
+                len: 0,
+                pixels_at: 0,
+                bpp: 1,
+                palette_colours: 2,
+                stored: 1,
+                expanded: 1,
+                rows: 1,
+                method: 1,
+            },
+            unknown_fields: Vec::new(),
+        }
+    }
+
+    fn annotation() -> crate::domain::page::Overlay {
+        crate::domain::page::Overlay {
+            kind: 1,
+            expanded: 0,
+            coded: Vec::new(),
+            pixels: None,
+            area: Some((100, 200, 300, 400)),
+        }
+    }
+
+    #[test]
+    fn standalone_previews_are_kept_as_pages() {
+        let mut pages = vec![preview(0), preview(1)];
+
+        assign_roles(&mut pages);
+
+        assert!(pages.iter().all(|page| page.role == Role::Sheet));
+        assert!(pages.iter().all(|page| page.belongs_to.is_none()));
+    }
+
+    #[test]
+    fn preview_after_a_body_is_a_thumbnail_but_next_orphan_is_a_page() {
+        let mut pages = vec![sheet(0, (21000, 29700)), preview(1), preview(2)];
+
+        assign_roles(&mut pages);
+
+        assert_eq!(pages[0].role, Role::Sheet);
+        assert_eq!(pages[1].role, Role::Thumbnail);
+        assert_eq!(pages[1].belongs_to, Some(0));
+        assert_eq!(pages[2].role, Role::Sheet);
+        assert_eq!(pages[2].belongs_to, None);
+    }
+
+    #[test]
+    fn properties_only_sheet_is_merged_into_the_following_body() {
+        let mut pages = vec![sheet(0, (21000, 29700)), sheet(1, (21000, 29700))];
+        pages[0].overlays.push(annotation());
+        pages[1].data = PageData::Encoded {
+            offset: 0,
+            len: 1,
+            kind_code: 9,
+            aux_len: None,
+            method: None,
+            colour: None,
+        };
+
+        merge_orphan_overlay_sheets(&mut pages);
+
+        assert!(pages[0].overlays.is_empty());
+        assert_eq!(pages[0].role, Role::Data);
+        assert_eq!(pages[1].overlays, vec![annotation()]);
     }
 
     #[test]

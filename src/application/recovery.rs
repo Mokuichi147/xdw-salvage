@@ -19,6 +19,19 @@ pub fn decode_page<D: PageDecoder + ?Sized>(
     decoder.decode(data, page).filter(|page| !page.is_empty())
 }
 
+/// Decode a page with the document context needed by legacy page-sized
+/// previews whose adjacent thumbnail contains the rest of the page.
+pub fn decode_page_for_document<D: PageDecoder + ?Sized>(
+    data: &[u8],
+    page: &Page,
+    document: &Document,
+    decoder: &D,
+) -> Option<Metafile> {
+    decoder
+        .decode_with_document(data, page, document)
+        .filter(|page| !page.is_empty())
+}
+
 /// Calculate coverage using the structural facts in `Document` and the
 /// injected page decoder for pages held in a coded representation.
 pub fn coverage<D: PageDecoder + ?Sized>(
@@ -79,7 +92,7 @@ impl<'a, D: PageDecoder + ?Sized> RecoveryView<'a, D> {
     }
 
     pub fn decode(&self, page: &Page) -> Option<Metafile> {
-        decode_page(self.data, page, self.decoder)
+        decode_page_for_document(self.data, page, self.document, self.decoder)
     }
 
     pub fn coverage(&self) -> Coverage {
