@@ -9,7 +9,9 @@ use crate::application::ports::{AttachmentScanner, PageDecoder};
 use crate::application::recovery;
 use crate::domain::output::Language as Lang;
 use crate::domain::page::{Page, PageData};
-use crate::domain::rendering::{self, Fill, Image, Metafile, Rect, Segment, Shape, Source};
+use crate::domain::rendering::{
+    self, Fill, Image, Metafile, RasterOp, Rect, Segment, Shape, Source,
+};
 use crate::domain::{DisplayPage, Document};
 use crate::infrastructure::{png, LzhMetafileDecoder, MagicAttachmentScanner};
 
@@ -764,6 +766,16 @@ fn draw_metafile_with_viewbox(
                 ));
             }
             Item::Image(img) => {
+                // SRCINVERT is an intermediate XOR pass in the common
+                // SRCINVERT -> SRCAND -> SRCINVERT transparent-picture
+                // sequence.  SVG cannot express that operation by placing
+                // the source bitmap as an ordinary image; doing so can hide
+                // text and vector artwork underneath it.  The PDF adapter
+                // recognises the complete masked sequence; HTML currently
+                // omits the unsupported intermediate pass instead.
+                if img.raster_op == RasterOp::SourceInvert {
+                    continue;
+                }
                 let href = match img.source {
                     Source::Stored { ordinal, .. } => {
                         let Some(pic) = picture_of(ordinal) else {

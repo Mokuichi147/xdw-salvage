@@ -1614,6 +1614,10 @@ fn draw_page(
     )
 }
 
+fn should_draw_source_invert(raster_op: RasterOp, masked: bool) -> bool {
+    raster_op != RasterOp::SourceInvert || masked
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_page_with_viewbox(
     w: &mut Writer,
@@ -1875,6 +1879,9 @@ fn draw_page_with_viewbox(
             }
             Item::Image(index, img) => {
                 if masked_parts[index] {
+                    continue;
+                }
+                if !should_draw_source_invert(img.raster_op, masked_names.contains_key(&index)) {
                     continue;
                 }
                 let name = masked_names.get(&index).or_else(|| match img.source {
@@ -2786,9 +2793,10 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::mask_alpha;
+    use super::should_draw_source_invert;
     use super::{oriented_place, pdf_paper_points, Place};
-    use crate::domain::rendering::Metafile;
     use crate::domain::rendering::Raster;
+    use crate::domain::rendering::{Metafile, RasterOp};
 
     #[test]
     fn source_and_mask_zero_bits_become_opaque_alpha() {
@@ -2832,6 +2840,13 @@ mod tests {
         let custom = pdf_paper_points(Some((10_000, 14_800))).expect("custom");
         assert!((custom.0 - 283.44).abs() < 0.01);
         assert!((custom.1 - 419.52).abs() < 0.01);
+    }
+
+    #[test]
+    fn source_invert_is_only_drawn_as_part_of_a_recognised_mask() {
+        assert!(!should_draw_source_invert(RasterOp::SourceInvert, false));
+        assert!(should_draw_source_invert(RasterOp::SourceInvert, true));
+        assert!(should_draw_source_invert(RasterOp::Copy, false));
     }
 
     #[test]
