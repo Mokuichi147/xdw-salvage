@@ -262,6 +262,13 @@ fn run_info(files: &[String]) -> ExitCode {
             cov.pictures,
             cov.sheets_with_pictures
         );
+        if !doc.display_pages.is_empty() && doc.display_pages.len() != cov.sheets {
+            outln!(
+                "  displayed pages {} (properties compose {} sheet entr(y/ies) into the shown pages)",
+                doc.display_pages.len(),
+                cov.sheets
+            );
+        }
         if cov.sheets_blank > 0 {
             outln!(
                 "  {} sheet(s) come out blank: neither the sheet nor any artwork on it recovers",
@@ -793,20 +800,42 @@ fn run_manifest(files: &[String], out: Option<&Path>) -> ExitCode {
         };
         let doc = &asset.document;
         let exp = Expectation::of(doc);
-        for (i, p) in doc.content_pages().enumerate() {
-            let (w, h) = exp
-                .size_mm(i)
-                .map(|(w, h)| (format!("{w:.1}"), format!("{h:.1}")))
-                .unwrap_or_default();
-            csv.push_str(&format!(
-                "{},{},{},{},{},{}\n",
-                csv_field(f),
-                i + 1,
-                p.kind_name(),
-                w,
-                h,
-                p.is_recoverable()
-            ));
+        if !doc.display_pages.is_empty() {
+            for (i, display) in doc.display_pages.iter().enumerate() {
+                let (w, h) = exp
+                    .size_mm(i)
+                    .map(|(w, h)| (format!("{w:.1}"), format!("{h:.1}")))
+                    .unwrap_or_default();
+                let recoverable = display.members.iter().any(|member| {
+                    doc.pages
+                        .get(member.page_index)
+                        .is_some_and(|page| page.is_recoverable())
+                });
+                csv.push_str(&format!(
+                    "{},{},display,{},{},{}\n",
+                    csv_field(f),
+                    i + 1,
+                    w,
+                    h,
+                    recoverable
+                ));
+            }
+        } else {
+            for (i, p) in doc.sheets().enumerate() {
+                let (w, h) = exp
+                    .size_mm(i)
+                    .map(|(w, h)| (format!("{w:.1}"), format!("{h:.1}")))
+                    .unwrap_or_default();
+                csv.push_str(&format!(
+                    "{},{},{},{},{},{}\n",
+                    csv_field(f),
+                    i + 1,
+                    p.kind_name(),
+                    w,
+                    h,
+                    p.is_recoverable()
+                ));
+            }
         }
         outln!(
             "{}: a faithful conversion has {} page(s)  ({} preview entr(y/ies) must not appear)",

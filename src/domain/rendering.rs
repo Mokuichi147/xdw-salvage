@@ -313,6 +313,85 @@ impl Metafile {
         (self.frame_mm100.0 as f32 * k, self.frame_mm100.1 as f32 * k)
     }
 
+    /// Bounding box of the artwork actually emitted by the metafile, in
+    /// device units.  Some DocuWorks page bodies retain a large screen-device
+    /// extent even though their drawing occupies only a small local region;
+    /// display-page composition needs this box to place such artwork in the
+    /// properties rectangle that names its real size.
+    pub fn content_bounds(&self) -> Option<Rect> {
+        let mut bounds: Option<Rect> = None;
+        let mut include = |next: Rect| {
+            bounds = Some(match bounds {
+                None => next,
+                Some(current) => Rect {
+                    left: current.left.min(next.left),
+                    top: current.top.min(next.top),
+                    right: current.right.max(next.right),
+                    bottom: current.bottom.max(next.bottom),
+                },
+            });
+        };
+        for fill in &self.fills {
+            include(Rect {
+                left: fill.left,
+                top: fill.top,
+                right: fill.right,
+                bottom: fill.bottom,
+            });
+        }
+        for image in &self.images {
+            include(Rect {
+                left: image.left,
+                top: image.top,
+                right: image.right,
+                bottom: image.bottom,
+            });
+        }
+        for shape in &self.shapes {
+            if let Some(mut next) = shape.path.bounds() {
+                if let Some((_, width)) = shape.stroke {
+                    let pad = width.max(0.0) * 0.5;
+                    next.left -= pad;
+                    next.top -= pad;
+                    next.right += pad;
+                    next.bottom += pad;
+                }
+                include(next);
+            }
+        }
+        for text in &self.text {
+            for (i, ch) in text.chars.iter().enumerate() {
+                if ch.is_whitespace() {
+                    continue;
+                }
+                let Some(&left) = text.xs.get(i) else {
+                    continue;
+                };
+                let width = text.size * if (*ch as u32) < 0x100 { 0.55 } else { 1.0 };
+                if left.is_finite()
+                    && width.is_finite()
+                    && text.size.is_finite()
+                    && text.y.is_finite()
+                {
+                    include(Rect {
+                        left,
+                        top: text.y - text.size,
+                        right: left + width,
+                        bottom: text.y,
+                    });
+                }
+            }
+        }
+        bounds.filter(|r| {
+            r.left.is_finite()
+                && r.top.is_finite()
+                && r.right.is_finite()
+                && r.bottom.is_finite()
+                && r.right > r.left
+                && r.bottom > r.top
+        })
+    }
+
     /// 文字レイヤーが正立した縦書き配置かどうか。
     ///
     /// メタファイルによっては、字を1字ずつ連続する縦座標へ配置し、直角の

@@ -8,12 +8,20 @@ use std::collections::BTreeMap;
 use crate::application::ports::{AttachmentScanner, PageDecoder};
 use crate::application::recovery;
 pub use crate::domain::output::Language as Lang;
-use crate::domain::page::{Page, PageData};
+use crate::domain::page::{Overlay, Page, PageData};
 use crate::domain::rendering::{
     self, Fill, FontKind, Image, Metafile, Raster, RasterOp, Rect, Segment, Shape, Source, Text,
 };
-use crate::domain::Document;
+use crate::domain::{DisplayPage, Document};
 use crate::infrastructure::{deflate, jpeg, ttf, LzhMetafileDecoder, MagicAttachmentScanner};
+
+type FontIds = (
+    usize,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+);
 
 /// How to treat pages whose image cannot be recovered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,10 +85,51 @@ pub struct Options {
     pub carry_source: bool,
 }
 
-/// A4 in points.
-pub const A4: (f32, f32) = (595.28, 841.89);
+/// A4 in points on the 600 dpi page grid used by Windows print output.
+pub const A4: (f32, f32) = (595.32, 841.92);
 /// US Letter in points.
 pub const LETTER: (f32, f32) = (612.0, 792.0);
+
+/// Standard paper sizes which an image-derived XDW frame may miss by a few
+/// hundredths of a millimetre.  The orientation is part of each entry.
+const STANDARD_PAPERS_MM100: &[(u32, u32)] = &[
+    (10_500, 14_800),
+    (14_800, 10_500),
+    (14_800, 21_000),
+    (21_000, 14_800),
+    (18_200, 25_700),
+    (25_700, 18_200),
+    (21_000, 29_700),
+    (29_700, 21_000),
+    (21_590, 27_940),
+    (27_940, 21_590),
+    (25_700, 36_400),
+    (36_400, 25_700),
+    (29_700, 42_000),
+    (42_000, 29_700),
+];
+
+/// Convert an XDW paper size to the PDF page grid used by the reference
+/// printouts.  Windows print drivers describe a page in 600-dpi device units,
+/// so using the mathematically exact millimetre conversion leaves a visible
+/// metadata difference such as 595.28 versus 595.32 points.  Scanned JPEG
+/// bounds can also be a few hundredths of a millimetre short of a standard
+/// sheet; recognise only that narrow case and keep arbitrary paper sizes
+/// unchanged.
+fn pdf_paper_points(paper: Option<(u32, u32)>) -> Option<(f32, f32)> {
+    paper.map(|(w, h)| {
+        let (w, h) = STANDARD_PAPERS_MM100
+            .iter()
+            .copied()
+            .find(|(sw, sh)| w.abs_diff(*sw) <= 10 && h.abs_diff(*sh) <= 10)
+            .unwrap_or((w, h));
+        let to_points = |mm100: u32| {
+            let device = (mm100 as f64 * 600.0 / 2540.0).round();
+            (device * 72.0 / 600.0) as f32
+        };
+        (to_points(w), to_points(h))
+    })
+}
 
 impl Default for Options {
     fn default() -> Self {
@@ -440,13 +489,7 @@ where
 {
     let mut w = Writer::new();
     let pages_id = w.reserve();
-    let mut font_id: Option<(
-        usize,
-        Option<usize>,
-        Option<usize>,
-        Option<usize>,
-        Option<usize>,
-    )> = None;
+    let mut font_id: Option<FontIds> = None;
     // One embedded font serves every page, but which glyphs it must carry is
     // only known once every page has been drawn, so its id is reserved now and
     // its body written at the end.
@@ -471,11 +514,23 @@ where
     // and the pictures a sheet is made of; putting those on sheets of their own
     // would turn a one page pamphlet into a four page document and make the
     // page numbering meaningless.
-    let selected: Vec<&Page> = doc
-        .pages
-        .iter()
-        .filter(|p| p.is_sheet() || (opts.include_previews && p.is_preview()))
-        .collect();
+    let display_mode = !doc.display_pages.is_empty();
+    let selected: Vec<&Page> = if display_mode {
+        doc.display_pages
+            .iter()
+            .filter_map(|display| {
+                display
+                    .members
+                    .first()
+                    .and_then(|member| doc.pages.get(member.page_index))
+            })
+            .collect()
+    } else {
+        doc.pages
+            .iter()
+            .filter(|p| p.is_sheet() || (opts.include_previews && p.is_preview()))
+            .collect()
+    };
 
     // Some saved-over documents keep a small, text-only serial-number sheet
     // immediately after the JPEG it annotates.  It is a drawing layer, not a
@@ -483,7 +538,7 @@ where
     // and omit it from the output page sequence.
     let mut merged_labels: Vec<Option<Metafile>> = vec![None; selected.len()];
     let mut merge_label = vec![false; selected.len()];
-    if opts.decode {
+    if opts.decode && !display_mode {
         for i in 1..selected.len() {
             let previous = selected[i - 1];
             let label = selected[i];
@@ -504,65 +559,330 @@ where
     }
 
     let mut page_no = 0usize;
-    for (ordinal, p) in selected.iter().enumerate() {
-        if merge_label[ordinal] {
-            continue;
+    if display_mode {
+        for display in &doc.display_pages {
+            page_no += 1;
+            let rendered = draw_display_page(
+                &mut w,
+                data,
+                doc,
+                display,
+                decoder,
+                opts.paper,
+                opts.decode,
+                opts.font.as_deref(),
+                &mut used_glyphs,
+                &mut glyph_widths,
+                &mut glyph_remapper,
+            );
+            let mut content = rendered.content;
+            let xobjects = rendered.xobjects;
+            if !rendered.recovered {
+                if opts.missing == Missing::Skip {
+                    report.skipped += 1;
+                    continue;
+                }
+                content.push_str(&placeholder_content(
+                    rendered.pw,
+                    rendered.ph,
+                    page_no,
+                    opts.lang,
+                ));
+            }
+            let fonts = if rendered.drawn.glyphs > 0 || !rendered.recovered {
+                let font_lang = if rendered.drawn.glyphs > 0 {
+                    Lang::Japanese
+                } else {
+                    opts.lang
+                };
+                let (latin, cjk, mincho, pmincho, pgothic) =
+                    note_fonts(&mut w, &mut font_id, font_lang);
+                match (embedded, font_lang) {
+                    (Some(id), Lang::Japanese) => format!(
+                        "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
+                        cjk.expect("Japanese font"),
+                        mincho.expect("MS Mincho font"),
+                        pmincho.expect("MS P Mincho font"),
+                        pgothic.expect("MS P Gothic font")
+                    ),
+                    (Some(id), Lang::English) => format!("/FA {id} 0 R"),
+                    (None, _) => font_resources(latin, cjk, mincho, pmincho, pgothic),
+                }
+            } else {
+                String::new()
+            };
+            let resources = if fonts.is_empty() {
+                format!("/XObject << {xobjects} >>")
+            } else if xobjects.is_empty() {
+                format!("/Font << {fonts} >>")
+            } else {
+                format!("/Font << {fonts} >> /XObject << {xobjects} >>")
+            };
+            let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
+            let pid = w.add(format!(
+                "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {:.2} {:.2}]{rotate} \
+                 /Resources << {resources} >> /Contents {cid} 0 R >>",
+                rendered.pw,
+                rendered.ph,
+                rotate = if rendered.rotation % 360 != 0 {
+                    format!(" /Rotate {}", rendered.rotation % 360)
+                } else {
+                    String::new()
+                },
+            ));
+            kids.push(pid);
+            report.glyphs += rendered.drawn.glyphs;
+            report.pictures_placed += rendered.drawn.pictures;
+            if rendered.recovered {
+                report.drawn += 1;
+            } else {
+                gaps.push((pid, page_no));
+                report.placeholders += 1;
+            }
         }
-        page_no += 1;
-        // The page is drawn the way it is stored; the reader turns it the
-        // way the document says it is shown.
-        let rotate = if p.rotation % 360 != 0 {
-            format!(" /Rotate {}", p.rotation % 360)
-        } else {
-            String::new()
-        };
-        let decoded = opts
-            .decode
-            .then(|| recovery::decode_page(data, p, decoder))
-            .flatten();
-        match &p.data {
-            PageData::Jpeg { offset, len } => {
-                let stream = &data[*offset..*offset + *len];
-                let info = jpeg::info(stream);
-                let (w_px, h_px) = info
-                    .map(|i| (i.width, i.height))
-                    .or(p.pixels)
-                    .unwrap_or((1, 1));
-                let natural = p
-                    .paper_points()
-                    .or_else(|| info.map(|i| i.points()))
-                    .unwrap_or((w_px as f32, h_px as f32));
-                let (pw, ph) = opts.paper.unwrap_or(natural);
+    } else {
+        for (ordinal, p) in selected.iter().enumerate() {
+            if merge_label[ordinal] {
+                continue;
+            }
+            page_no += 1;
+            // The page is drawn the way it is stored; the reader turns it the
+            // way the document says it is shown.
+            let rotate = if p.rotation % 360 != 0 {
+                format!(" /Rotate {}", p.rotation % 360)
+            } else {
+                String::new()
+            };
+            let decoded = opts
+                .decode
+                .then(|| recovery::decode_page(data, p, decoder))
+                .flatten();
+            match &p.data {
+                PageData::Jpeg { offset, len } => {
+                    let stream = &data[*offset..*offset + *len];
+                    let info = jpeg::info(stream);
+                    let (w_px, h_px) = info
+                        .map(|i| (i.width, i.height))
+                        .or(p.pixels)
+                        .unwrap_or((1, 1));
+                    let natural = pdf_paper_points(p.paper)
+                        .or_else(|| info.map(|i| i.points()))
+                        .unwrap_or((w_px as f32, h_px as f32));
+                    let (pw, ph) = opts.paper.unwrap_or(natural);
 
-                // A picture page may carry a drawing of its own that says
-                // where the picture and its companions go and what is
-                // written over them. When it does, that is the page.
-                let mut overlay = String::new();
-                let mut overlay_xobjects = String::new();
-                let over = if opts.decode && p.overlays.iter().any(|o| o.area.is_none()) {
-                    draw_overlays(
+                    // A picture page may carry a drawing of its own that says
+                    // where the picture and its companions go and what is
+                    // written over them. When it does, that is the page.
+                    let mut overlay = String::new();
+                    let mut overlay_xobjects = String::new();
+                    let over = if opts.decode && p.overlays.iter().any(|o| o.area.is_none()) {
+                        draw_overlay_list(
+                            &mut w,
+                            data,
+                            doc,
+                            p,
+                            &p.overlays,
+                            decoder,
+                            pw,
+                            ph,
+                            &mut overlay,
+                            &mut overlay_xobjects,
+                            opts.font.as_deref(),
+                            &mut used_glyphs,
+                            &mut glyph_widths,
+                            &mut glyph_remapper,
+                        )
+                    } else {
+                        Drawn {
+                            glyphs: 0,
+                            pictures: 0,
+                            painted: false,
+                        }
+                    };
+                    if over.pictures > 0 {
+                        let fonts = match embedded {
+                            Some(id) => {
+                                let (_, cjk, mincho, pmincho, pgothic) =
+                                    note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                                format!(
+                                    "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
+                                    cjk.expect("Japanese font"),
+                                    mincho.expect("MS Mincho font"),
+                                    pmincho.expect("MS P Mincho font"),
+                                    pgothic.expect("MS P Gothic font")
+                                )
+                            }
+                            None => {
+                                let (latin, cjk, mincho, pmincho, pgothic) =
+                                    note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                                font_resources(latin, cjk, mincho, pmincho, pgothic)
+                            }
+                        };
+                        let cid = w.add_stream("<< >>".to_string(), overlay.as_bytes());
+                        let pid = w.add(format!(
+                        "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
+                         /Resources << /Font << {fonts} >> /XObject << {overlay_xobjects} >> >> \
+                         /Contents {cid} 0 R >>"
+                    ));
+                        kids.push(pid);
+                        report.embedded += 1;
+                        report.glyphs += over.glyphs;
+                        report.pictures_placed += over.pictures.saturating_sub(1);
+                        continue;
+                    }
+
+                    // Contain-fit, never enlarging: an image smaller than the sheet
+                    // keeps its own size rather than being blown up.
+                    let scale = (pw / natural.0).min(ph / natural.1).min(1.0);
+                    let (dw, dh) = (natural.0 * scale, natural.1 * scale);
+                    let dy = (ph - dh) / 2.0;
+                    let space = match info.map(|i| i.components).unwrap_or(3) {
+                        1 => "/DeviceGray",
+                        4 => "/DeviceCMYK",
+                        _ => "/DeviceRGB",
+                    };
+                    let img = w.add_stream(
+                        format!(
+                            "<< /Type /XObject /Subtype /Image /Width {w_px} /Height {h_px} \
+                         /ColorSpace {space} /BitsPerComponent 8 /Filter /DCTDecode >>"
+                        ),
+                        stream,
+                    );
+                    // A sheet that is itself a picture can still have pictures of
+                    // its own sitting on it. Dropping them because the sheet came
+                    // out would be throwing away recovered content, so
+                    // the sheet takes the upper part of the page and they follow.
+                    let runs = doc.picture_runs(p.index);
+                    let mut xobjects = format!("/Im0 {img} 0 R ");
+                    let (dw, dh, dy) = if runs.is_empty() {
+                        (dw, dh, dy)
+                    } else {
+                        let k = (ph * 0.52) / dh.max(0.01);
+                        let k = k.min(1.0);
+                        (dw * k, dh * k, ph - margin_of(pw, ph) - dh * k)
+                    };
+                    let dx = (pw - dw) / 2.0;
+                    let mut content =
+                        format!("q {dw:.2} 0 0 {dh:.2} {dx:.2} {dy:.2} cm /Im0 Do Q\n");
+                    if !runs.is_empty() {
+                        report.pictures_placed += stack_pictures(
+                            &mut w,
+                            data,
+                            &runs,
+                            pw,
+                            ph * 0.46,
+                            &mut content,
+                            &mut xobjects,
+                        );
+                    }
+                    // Text-only page overlays belong above the JPEG. Draw them
+                    // after the image so they cannot disappear underneath it.
+                    let mut drawn_glyphs = 0usize;
+                    if over.painted && over.pictures == 0 {
+                        content.push_str(&overlay);
+                        xobjects.push_str(&overlay_xobjects);
+                        drawn_glyphs += over.glyphs;
+                    }
+                    if let Some(label) = merged_labels.get(ordinal + 1).and_then(Option::as_ref) {
+                        if let Some(place) = serial_label_place(label, pw, ph) {
+                            let drawn = draw_page(
+                                &mut w,
+                                data,
+                                &[],
+                                label,
+                                place,
+                                "L",
+                                &mut content,
+                                &mut xobjects,
+                                opts.font.as_deref(),
+                                &mut used_glyphs,
+                                &mut glyph_widths,
+                                &mut glyph_remapper,
+                            );
+                            drawn_glyphs += drawn.glyphs;
+                        }
+                    }
+                    let fonts = if drawn_glyphs > 0 {
+                        match embedded {
+                            Some(id) => {
+                                let (_, cjk, mincho, pmincho, pgothic) =
+                                    note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                                format!(
+                                    "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
+                                    cjk.expect("Japanese font"),
+                                    mincho.expect("MS Mincho font"),
+                                    pmincho.expect("MS P Mincho font"),
+                                    pgothic.expect("MS P Gothic font")
+                                )
+                            }
+                            None => {
+                                let (latin, cjk, mincho, pmincho, pgothic) =
+                                    note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                                font_resources(latin, cjk, mincho, pmincho, pgothic)
+                            }
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let resources = if fonts.is_empty() {
+                        format!("/XObject << {xobjects} >>")
+                    } else {
+                        format!("/Font << {fonts} >> /XObject << {xobjects} >>")
+                    };
+                    let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
+                    let pid = w.add(format!(
+                    "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
+                     /Resources << {resources} >> /Contents {cid} 0 R >>"
+                ));
+                    kids.push(pid);
+                    report.embedded += 1;
+                    report.glyphs += drawn_glyphs;
+                }
+                // The sheet is in the container's own coding. Expand it: what comes
+                // out is a metafile, and its text is real text with real positions,
+                // so the page can be redrawn rather than apologised for.
+                PageData::Encoded { .. } if decoded.is_some() => {
+                    let meta = decoded.as_ref().expect("decoded guard above");
+                    let (nw, nh) = meta.points();
+                    let (pw, ph) = opts
+                        .paper
+                        .or_else(|| pdf_paper_points(p.paper))
+                        .unwrap_or(if nw > 1.0 && nh > 1.0 { (nw, nh) } else { A4 });
+                    let mut content = String::new();
+                    let mut xobjects = String::new();
+                    let stored: Vec<&Page> = doc.pictures_on(p.index).collect();
+                    let drawn = draw_page(
                         &mut w,
                         data,
-                        doc,
-                        p,
-                        decoder,
-                        pw,
-                        ph,
-                        &mut overlay,
-                        &mut overlay_xobjects,
+                        &stored,
+                        meta,
+                        Place::sheet(pw, ph),
+                        "M",
+                        &mut content,
+                        &mut xobjects,
                         opts.font.as_deref(),
                         &mut used_glyphs,
                         &mut glyph_widths,
                         &mut glyph_remapper,
-                    )
-                } else {
-                    Drawn {
-                        glyphs: 0,
-                        pictures: 0,
-                        painted: false,
-                    }
-                };
-                if over.pictures > 0 {
+                    );
+                    let over = draw_overlay_list(
+                        &mut w,
+                        data,
+                        doc,
+                        p,
+                        &p.overlays,
+                        decoder,
+                        pw,
+                        ph,
+                        &mut content,
+                        &mut xobjects,
+                        opts.font.as_deref(),
+                        &mut used_glyphs,
+                        &mut glyph_widths,
+                        &mut glyph_remapper,
+                    );
+                    let (glyphs, placed) =
+                        (drawn.glyphs + over.glyphs, drawn.pictures + over.pictures);
                     let fonts = match embedded {
                         Some(id) => {
                             let (_, cjk, mincho, pmincho, pgothic) =
@@ -581,189 +901,9 @@ where
                             font_resources(latin, cjk, mincho, pmincho, pgothic)
                         }
                     };
-                    let cid = w.add_stream("<< >>".to_string(), overlay.as_bytes());
+
+                    let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
                     let pid = w.add(format!(
-                        "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
-                         /Resources << /Font << {fonts} >> /XObject << {overlay_xobjects} >> >> \
-                         /Contents {cid} 0 R >>"
-                    ));
-                    kids.push(pid);
-                    report.embedded += 1;
-                    report.glyphs += over.glyphs;
-                    report.pictures_placed += over.pictures.saturating_sub(1);
-                    continue;
-                }
-
-                // Contain-fit, never enlarging: an image smaller than the sheet
-                // keeps its own size rather than being blown up.
-                let scale = (pw / natural.0).min(ph / natural.1).min(1.0);
-                let (dw, dh) = (natural.0 * scale, natural.1 * scale);
-                let dy = (ph - dh) / 2.0;
-                let space = match info.map(|i| i.components).unwrap_or(3) {
-                    1 => "/DeviceGray",
-                    4 => "/DeviceCMYK",
-                    _ => "/DeviceRGB",
-                };
-                let img = w.add_stream(
-                    format!(
-                        "<< /Type /XObject /Subtype /Image /Width {w_px} /Height {h_px} \
-                         /ColorSpace {space} /BitsPerComponent 8 /Filter /DCTDecode >>"
-                    ),
-                    stream,
-                );
-                // A sheet that is itself a picture can still have pictures of
-                // its own sitting on it. Dropping them because the sheet came
-                // out would be throwing away recovered content, so
-                // the sheet takes the upper part of the page and they follow.
-                let runs = doc.picture_runs(p.index);
-                let mut xobjects = format!("/Im0 {img} 0 R ");
-                let (dw, dh, dy) = if runs.is_empty() {
-                    (dw, dh, dy)
-                } else {
-                    let k = (ph * 0.52) / dh.max(0.01);
-                    let k = k.min(1.0);
-                    (dw * k, dh * k, ph - margin_of(pw, ph) - dh * k)
-                };
-                let dx = (pw - dw) / 2.0;
-                let mut content = format!("q {dw:.2} 0 0 {dh:.2} {dx:.2} {dy:.2} cm /Im0 Do Q\n");
-                if !runs.is_empty() {
-                    report.pictures_placed += stack_pictures(
-                        &mut w,
-                        data,
-                        &runs,
-                        pw,
-                        ph * 0.46,
-                        &mut content,
-                        &mut xobjects,
-                    );
-                }
-                // Text-only page overlays belong above the JPEG. Draw them
-                // after the image so they cannot disappear underneath it.
-                let mut drawn_glyphs = 0usize;
-                if over.painted && over.pictures == 0 {
-                    content.push_str(&overlay);
-                    xobjects.push_str(&overlay_xobjects);
-                    drawn_glyphs += over.glyphs;
-                }
-                if let Some(label) = merged_labels.get(ordinal + 1).and_then(Option::as_ref) {
-                    if let Some(place) = serial_label_place(label, pw, ph) {
-                        let drawn = draw_page(
-                            &mut w,
-                            data,
-                            &[],
-                            label,
-                            place,
-                            "L",
-                            &mut content,
-                            &mut xobjects,
-                            opts.font.as_deref(),
-                            &mut used_glyphs,
-                            &mut glyph_widths,
-                            &mut glyph_remapper,
-                        );
-                        drawn_glyphs += drawn.glyphs;
-                    }
-                }
-                let fonts = if drawn_glyphs > 0 {
-                    match embedded {
-                        Some(id) => {
-                            let (_, cjk, mincho, pmincho, pgothic) =
-                                note_fonts(&mut w, &mut font_id, Lang::Japanese);
-                            format!(
-                                "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
-                                cjk.expect("Japanese font"),
-                                mincho.expect("MS Mincho font"),
-                                pmincho.expect("MS P Mincho font"),
-                                pgothic.expect("MS P Gothic font")
-                            )
-                        }
-                        None => {
-                            let (latin, cjk, mincho, pmincho, pgothic) =
-                                note_fonts(&mut w, &mut font_id, Lang::Japanese);
-                            font_resources(latin, cjk, mincho, pmincho, pgothic)
-                        }
-                    }
-                } else {
-                    String::new()
-                };
-                let resources = if fonts.is_empty() {
-                    format!("/XObject << {xobjects} >>")
-                } else {
-                    format!("/Font << {fonts} >> /XObject << {xobjects} >>")
-                };
-                let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
-                let pid = w.add(format!(
-                    "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
-                     /Resources << {resources} >> /Contents {cid} 0 R >>"
-                ));
-                kids.push(pid);
-                report.embedded += 1;
-                report.glyphs += drawn_glyphs;
-            }
-            // The sheet is in the container's own coding. Expand it: what comes
-            // out is a metafile, and its text is real text with real positions,
-            // so the page can be redrawn rather than apologised for.
-            PageData::Encoded { .. } if decoded.is_some() => {
-                let meta = decoded.as_ref().expect("decoded guard above");
-                let (nw, nh) = meta.points();
-                let (pw, ph) = opts
-                    .paper
-                    .or_else(|| p.paper_points())
-                    .unwrap_or(if nw > 1.0 && nh > 1.0 { (nw, nh) } else { A4 });
-                let mut content = String::new();
-                let mut xobjects = String::new();
-                let stored: Vec<&Page> = doc.pictures_on(p.index).collect();
-                let drawn = draw_page(
-                    &mut w,
-                    data,
-                    &stored,
-                    meta,
-                    Place::sheet(pw, ph),
-                    "M",
-                    &mut content,
-                    &mut xobjects,
-                    opts.font.as_deref(),
-                    &mut used_glyphs,
-                    &mut glyph_widths,
-                    &mut glyph_remapper,
-                );
-                let over = draw_overlays(
-                    &mut w,
-                    data,
-                    doc,
-                    p,
-                    decoder,
-                    pw,
-                    ph,
-                    &mut content,
-                    &mut xobjects,
-                    opts.font.as_deref(),
-                    &mut used_glyphs,
-                    &mut glyph_widths,
-                    &mut glyph_remapper,
-                );
-                let (glyphs, placed) = (drawn.glyphs + over.glyphs, drawn.pictures + over.pictures);
-                let fonts = match embedded {
-                    Some(id) => {
-                        let (_, cjk, mincho, pmincho, pgothic) =
-                            note_fonts(&mut w, &mut font_id, Lang::Japanese);
-                        format!(
-                            "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
-                            cjk.expect("Japanese font"),
-                            mincho.expect("MS Mincho font"),
-                            pmincho.expect("MS P Mincho font"),
-                            pgothic.expect("MS P Gothic font")
-                        )
-                    }
-                    None => {
-                        let (latin, cjk, mincho, pmincho, pgothic) =
-                            note_fonts(&mut w, &mut font_id, Lang::Japanese);
-                        font_resources(latin, cjk, mincho, pmincho, pgothic)
-                    }
-                };
-
-                let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
-                let pid = w.add(format!(
                     "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
                      /Resources << /Font << {} >>{} >> /Contents {cid} 0 R >>",
                     fonts,
@@ -773,66 +913,70 @@ where
                         format!(" /XObject << {xobjects} >>")
                     }
                 ));
-                kids.push(pid);
-                report.drawn += 1;
-                report.glyphs += glyphs;
-                report.pictures_placed += placed;
-            }
-            _ if opts.missing == Missing::Placeholder => {
-                let (pw, ph) = opts.paper.or_else(|| p.paper_points()).unwrap_or(A4);
-                // Recovered overlays use the same Japanese CID font as a
-                // decoded page even when the placeholder note language is
-                // English. Reserve all source-face resources before drawing
-                // the overlay; draw_text selects them per recovered run.
-                let overlay_lang = if p.overlays.is_empty() {
-                    opts.lang
-                } else {
-                    Lang::Japanese
-                };
-                let (latin, cjk, mincho, pmincho, pgothic) =
-                    note_fonts(&mut w, &mut font_id, overlay_lang);
-                let mut content = String::new();
-                let mut xobjects = String::new();
-                let over = if opts.decode && !p.overlays.is_empty() {
-                    draw_overlays(
-                        &mut w,
-                        data,
-                        doc,
-                        p,
-                        decoder,
-                        pw,
-                        ph,
-                        &mut content,
-                        &mut xobjects,
-                        opts.font.as_deref(),
-                        &mut used_glyphs,
-                        &mut glyph_widths,
-                        &mut glyph_remapper,
-                    )
-                } else {
-                    Drawn {
-                        glyphs: 0,
-                        pictures: 0,
-                        painted: false,
-                    }
-                };
-                if over.painted {
-                    let fonts = match embedded {
-                        Some(id) => {
-                            let (_, cjk, mincho, pmincho, pgothic) =
-                                note_fonts(&mut w, &mut font_id, Lang::Japanese);
-                            format!(
-                                "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
-                                cjk.expect("Japanese font"),
-                                mincho.expect("MS Mincho font"),
-                                pmincho.expect("MS P Mincho font"),
-                                pgothic.expect("MS P Gothic font")
-                            )
-                        }
-                        None => font_resources(latin, cjk, mincho, pmincho, pgothic),
+                    kids.push(pid);
+                    report.drawn += 1;
+                    report.glyphs += glyphs;
+                    report.pictures_placed += placed;
+                }
+                _ if opts.missing == Missing::Placeholder => {
+                    let (pw, ph) = opts
+                        .paper
+                        .or_else(|| pdf_paper_points(p.paper))
+                        .unwrap_or(A4);
+                    // Recovered overlays use the same Japanese CID font as a
+                    // decoded page even when the placeholder note language is
+                    // English. Reserve all source-face resources before drawing
+                    // the overlay; draw_text selects them per recovered run.
+                    let overlay_lang = if p.overlays.is_empty() {
+                        opts.lang
+                    } else {
+                        Lang::Japanese
                     };
-                    let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
-                    let pid = w.add(format!(
+                    let (latin, cjk, mincho, pmincho, pgothic) =
+                        note_fonts(&mut w, &mut font_id, overlay_lang);
+                    let mut content = String::new();
+                    let mut xobjects = String::new();
+                    let over = if opts.decode && !p.overlays.is_empty() {
+                        draw_overlay_list(
+                            &mut w,
+                            data,
+                            doc,
+                            p,
+                            &p.overlays,
+                            decoder,
+                            pw,
+                            ph,
+                            &mut content,
+                            &mut xobjects,
+                            opts.font.as_deref(),
+                            &mut used_glyphs,
+                            &mut glyph_widths,
+                            &mut glyph_remapper,
+                        )
+                    } else {
+                        Drawn {
+                            glyphs: 0,
+                            pictures: 0,
+                            painted: false,
+                        }
+                    };
+                    if over.painted {
+                        let fonts = match embedded {
+                            Some(id) => {
+                                let (_, cjk, mincho, pmincho, pgothic) =
+                                    note_fonts(&mut w, &mut font_id, Lang::Japanese);
+                                format!(
+                                    "/FA {id} 0 R /FJ {} 0 R /FM {} 0 R /FP {} 0 R /FG {} 0 R",
+                                    cjk.expect("Japanese font"),
+                                    mincho.expect("MS Mincho font"),
+                                    pmincho.expect("MS P Mincho font"),
+                                    pgothic.expect("MS P Gothic font")
+                                )
+                            }
+                            None => font_resources(latin, cjk, mincho, pmincho, pgothic),
+                        };
+                        let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
+                        let pid = w.add(format!(
                         "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
                          /Resources << /Font << {fonts} >>{} >> /Contents {cid} 0 R >>",
                         if xobjects.is_empty() {
@@ -841,27 +985,27 @@ where
                             format!(" /XObject << {xobjects} >>")
                         }
                     ));
-                    kids.push(pid);
-                    report.drawn += 1;
-                    report.glyphs += over.glyphs;
-                    report.pictures_placed += over.pictures;
-                    continue;
-                }
+                        kids.push(pid);
+                        report.drawn += 1;
+                        report.glyphs += over.glyphs;
+                        report.pictures_placed += over.pictures;
+                        continue;
+                    }
 
-                let mut content = placeholder_content(pw, ph, page_no, opts.lang);
+                    let mut content = placeholder_content(pw, ph, page_no, opts.lang);
 
-                // The sheet itself cannot be reproduced, but the pictures it is
-                // made of are plain JPEG. Stack them on the sheet rather than
-                // leaving it blank: a pamphlet page comes back as its artwork,
-                // which is a great deal better than an empty rectangle.
-                xobjects.clear();
-                let runs = doc.picture_runs(p.index);
-                let placed =
-                    stack_pictures(&mut w, data, &runs, pw, ph, &mut content, &mut xobjects);
-                report.pictures_placed += placed;
+                    // The sheet itself cannot be reproduced, but the pictures it is
+                    // made of are plain JPEG. Stack them on the sheet rather than
+                    // leaving it blank: a pamphlet page comes back as its artwork,
+                    // which is a great deal better than an empty rectangle.
+                    xobjects.clear();
+                    let runs = doc.picture_runs(p.index);
+                    let placed =
+                        stack_pictures(&mut w, data, &runs, pw, ph, &mut content, &mut xobjects);
+                    report.pictures_placed += placed;
 
-                let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
-                let pid = w.add(format!(
+                    let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
+                    let pid = w.add(format!(
                     "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {pw:.2} {ph:.2}]{rotate} \
                      /Resources << /Font << {} >>{} >> /Contents {cid} 0 R >>",
                     font_resources(latin, cjk, mincho, pmincho, pgothic),
@@ -871,11 +1015,12 @@ where
                         format!(" /XObject << {xobjects} >>")
                     }
                 ));
-                kids.push(pid);
-                gaps.push((pid, page_no));
-                report.placeholders += 1;
+                    kids.push(pid);
+                    gaps.push((pid, page_no));
+                    report.placeholders += 1;
+                }
+                _ => report.skipped += 1,
             }
-            _ => report.skipped += 1,
         }
     }
 
@@ -884,8 +1029,10 @@ where
         let content = placeholder_content(A4.0, A4.1, 0, opts.lang);
         let cid = w.add_stream("<< >>".to_string(), content.as_bytes());
         let pid = w.add(format!(
-            "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 595.28 841.89] \
+            "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {:.2} {:.2}] \
              /Resources << /Font << {} >> >> /Contents {cid} 0 R >>",
+            A4.0,
+            A4.1,
             font_resources(latin, cjk, mincho, pmincho, pgothic)
         ));
         kids.push(pid);
@@ -1045,23 +1192,7 @@ where
 /// them, so a Japanese note is always accompanied by a plain line that every
 /// reader can show. A placeholder that renders blank would be worse than a
 /// clumsy one.
-fn note_fonts(
-    w: &mut Writer,
-    cache: &mut Option<(
-        usize,
-        Option<usize>,
-        Option<usize>,
-        Option<usize>,
-        Option<usize>,
-    )>,
-    lang: Lang,
-) -> (
-    usize,
-    Option<usize>,
-    Option<usize>,
-    Option<usize>,
-    Option<usize>,
-) {
+fn note_fonts(w: &mut Writer, cache: &mut Option<FontIds>, lang: Lang) -> FontIds {
     if let Some(ids) = *cache {
         return ids;
     }
@@ -1360,6 +1491,97 @@ impl Place {
     }
 }
 
+/// PDFの描画状態に適用する2次元変換。
+#[derive(Debug, Clone, Copy)]
+struct PdfMatrix {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+/// 表示ページの回転を、ページ全体の `/Rotate` ではなく描画内容へ適用する。
+///
+/// XDWの一部のEMFは、プロパティ上の用紙フレームを縦向きで保持したまま、
+/// 実際の描画座標を回転後の向きで格納する。ページを先に回転させると、
+/// PDFの用紙向きが逆になり、内容も縮小されるため、局所座標系で描いてから
+/// 最終ページへ回転配置する。
+fn oriented_place(place: Place, meta: &Metafile, rotation: u16) -> (Place, Option<PdfMatrix>) {
+    let rotation = rotation % 360;
+    if rotation == 0 {
+        return (place, None);
+    }
+    let (sw, sh) = meta.points();
+    if !(sw.is_finite() && sh.is_finite() && sw > 0.0 && sh > 0.0) {
+        return (place, None);
+    }
+    let (rotated_w, rotated_h) = if rotation % 180 == 90 {
+        (sh, sw)
+    } else if rotation == 180 {
+        (sw, sh)
+    } else {
+        return (place, None);
+    };
+    let fit = (place.w / rotated_w).min(place.h / rotated_h);
+    if !(fit.is_finite() && fit > 0.0) {
+        return (place, None);
+    }
+    let local_w = sw * fit;
+    let local_h = sh * fit;
+    let local = Place {
+        x: 0.0,
+        top: 0.0,
+        w: local_w,
+        h: local_h,
+        ph: local_h,
+    };
+    let top_pdf = place.ph - place.top;
+    let matrix = match rotation {
+        // 時計回り90度: (x, y) -> (height - y, x) in top-down coordinates.
+        90 => PdfMatrix {
+            a: 0.0,
+            b: -1.0,
+            c: 1.0,
+            d: 0.0,
+            e: place.x,
+            f: top_pdf,
+        },
+        180 => PdfMatrix {
+            a: -1.0,
+            b: 0.0,
+            c: 0.0,
+            d: -1.0,
+            e: place.x + local_w,
+            f: top_pdf,
+        },
+        // 反時計回り90度: (x, y) -> (y, width - x) in top-down coordinates.
+        270 => PdfMatrix {
+            a: 0.0,
+            b: 1.0,
+            c: -1.0,
+            d: 0.0,
+            e: place.x + local_h,
+            f: top_pdf - local_w,
+        },
+        _ => unreachable!("rotation was normalized above"),
+    };
+    (local, Some(matrix))
+}
+
+fn append_matrix(out: &mut String, matrix: PdfMatrix, body: &str) {
+    if body.is_empty() {
+        return;
+    }
+    out.push_str(&format!(
+        "q {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm\n",
+        matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f
+    ));
+    out.push_str(body);
+    out.push_str("Q\n");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_page(
     w: &mut Writer,
@@ -1374,6 +1596,39 @@ fn draw_page(
     used: &mut BTreeMap<u16, char>,
     glyph_widths: &mut BTreeMap<u16, u16>,
     remapper: &mut Option<subsetter::GlyphRemapper>,
+) -> Drawn {
+    draw_page_with_viewbox(
+        w,
+        data,
+        stored,
+        meta,
+        place,
+        tag,
+        out,
+        xobjects,
+        font,
+        used,
+        glyph_widths,
+        remapper,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_page_with_viewbox(
+    w: &mut Writer,
+    data: &[u8],
+    stored: &[&Page],
+    meta: &Metafile,
+    place: Place,
+    tag: &str,
+    out: &mut String,
+    xobjects: &mut String,
+    font: Option<&ttf::Font>,
+    used: &mut BTreeMap<u16, char>,
+    glyph_widths: &mut BTreeMap<u16, u16>,
+    remapper: &mut Option<subsetter::GlyphRemapper>,
+    viewbox: Option<Rect>,
 ) -> Drawn {
     let mut drawn = Drawn {
         glyphs: 0,
@@ -1392,9 +1647,20 @@ fn draw_page(
     } else {
         1.0
     };
+    let (origin_x, origin_y, scale_x, scale_y) = viewbox
+        .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+        .map(|r| {
+            (
+                r.left,
+                r.top,
+                place.w * ux / r.width(),
+                place.h * uy / r.height(),
+            )
+        })
+        .unwrap_or((0.0, 0.0, fit, fit));
     let upright_vertical = meta.uses_upright_vertical_text();
-    let px = |x: f32| place.x + x / ux * fit;
-    let py = |y: f32| (place.ph - place.top) - y / uy * fit;
+    let px = |x: f32| place.x + (x - origin_x) / ux * scale_x;
+    let py = |y: f32| (place.ph - place.top) - (y - origin_y) / uy * scale_y;
 
     // Stored pictures: pair each ordinal the page calls for with a picture
     // beside the sheet, then embed each picture once.
@@ -1663,7 +1929,7 @@ fn draw_page(
                     out.push_str(&format!(
                         "{} RG {:.2} w\n",
                         colour(rgb),
-                        (width / uy * fit).max(0.2)
+                        (width / uy * scale_y).max(0.2)
                     ));
                 }
                 path_ops(&s.path, px, py, out);
@@ -1685,7 +1951,7 @@ fn draw_page(
                     px,
                     py,
                     uy,
-                    fit,
+                    scale_y,
                     upright_vertical,
                     out,
                     font,
@@ -1706,14 +1972,226 @@ fn draw_page(
     drawn
 }
 
-/// Draw the overlays a page carries: its own drawing over the whole sheet
-/// and any annotations in their boxes.
+/// The result of drawing one logical displayed page.
+struct DisplayRender {
+    content: String,
+    xobjects: String,
+    pw: f32,
+    ph: f32,
+    rotation: u16,
+    drawn: Drawn,
+    recovered: bool,
+}
+
+/// Draw one logical displayed page, including the page-table bodies placed on
+/// it by a DocuMerge properties record.
 #[allow(clippy::too_many_arguments)]
-fn draw_overlays<D: PageDecoder + ?Sized>(
+fn draw_display_page<D: PageDecoder + ?Sized>(
+    w: &mut Writer,
+    data: &[u8],
+    doc: &Document,
+    display: &DisplayPage,
+    decoder: &D,
+    forced_paper: Option<(f32, f32)>,
+    decode: bool,
+    font: Option<&ttf::Font>,
+    used: &mut BTreeMap<u16, char>,
+    glyph_widths: &mut BTreeMap<u16, u16>,
+    remapper: &mut Option<subsetter::GlyphRemapper>,
+) -> DisplayRender {
+    let paper = display.paper.unwrap_or((21000, 29700));
+    let natural = pdf_paper_points(Some(paper)).unwrap_or(A4);
+    let (pw, ph) = forced_paper.unwrap_or(natural);
+    let mut content = String::new();
+    let mut xobjects = String::new();
+    let mut total = Drawn {
+        glyphs: 0,
+        pictures: 0,
+        painted: false,
+    };
+    let mut recovered = false;
+
+    for (n, member) in display.members.iter().enumerate() {
+        let Some(page) = doc.pages.get(member.page_index) else {
+            continue;
+        };
+        let place = member
+            .area
+            .map(|area| area_place(area, ph))
+            .unwrap_or_else(|| Place::sheet(pw, ph));
+        match page.data {
+            PageData::Jpeg { .. } => {
+                if draw_jpeg_at(
+                    w,
+                    data,
+                    page,
+                    place,
+                    &format!("D{n}"),
+                    &mut content,
+                    &mut xobjects,
+                ) {
+                    recovered = true;
+                }
+            }
+            PageData::Encoded { .. } if decode => {
+                if let Some(meta) = recovery::decode_page(data, page, decoder) {
+                    let stored = doc.pictures_on(page.index).collect::<Vec<_>>();
+                    let mut member_content = String::new();
+                    let mut member_xobjects = String::new();
+                    let viewbox = member_viewbox(member.area, &meta);
+                    let (draw_place, matrix) = oriented_place(place, &meta, display.rotation);
+                    let drawn = draw_page_with_viewbox(
+                        w,
+                        data,
+                        &stored,
+                        &meta,
+                        draw_place,
+                        &format!("D{n}"),
+                        &mut member_content,
+                        &mut member_xobjects,
+                        font,
+                        used,
+                        glyph_widths,
+                        remapper,
+                        viewbox,
+                    );
+                    if let Some(matrix) = matrix {
+                        append_matrix(&mut content, matrix, &member_content);
+                    } else {
+                        content.push_str(&member_content);
+                    }
+                    xobjects.push_str(&member_xobjects);
+                    recovered |= drawn.painted;
+                    total.glyphs += drawn.glyphs;
+                    total.pictures += drawn.pictures;
+                    total.painted |= drawn.painted;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(member) = display.members.first() {
+        if let Some(anchor) = doc.pages.get(member.page_index) {
+            let drawn = draw_overlay_list(
+                w,
+                data,
+                doc,
+                anchor,
+                &display.overlays,
+                decoder,
+                pw,
+                ph,
+                &mut content,
+                &mut xobjects,
+                font,
+                used,
+                glyph_widths,
+                remapper,
+            );
+            recovered |= drawn.painted;
+            total.glyphs += drawn.glyphs;
+            total.pictures += drawn.pictures;
+            total.painted |= drawn.painted;
+        }
+    }
+
+    DisplayRender {
+        content,
+        xobjects,
+        pw,
+        ph,
+        // 90度単位の回転は描画内容へ適用済みなので、MediaBoxの向きを
+        // さらに回転させない。未知の角度だけ従来のPDF回転を残す。
+        rotation: match display.rotation % 360 {
+            0 | 90 | 180 | 270 => 0,
+            other => other,
+        },
+        drawn: total,
+        recovered,
+    }
+}
+
+/// Some composed page bodies are authored in a large screen-device extent but
+/// contain only a small vector stamp or label.  Their properties rectangle is
+/// the actual displayed object, so use the occupied drawing box as the local
+/// viewBox when the metafile clearly has that mismatch.
+fn member_viewbox(area: Option<(u32, u32, u32, u32)>, meta: &Metafile) -> Option<Rect> {
+    let _ = area?;
+    let bounds = meta.content_bounds()?;
+    let (dw, dh) = (
+        meta.device.0.unsigned_abs() as f32,
+        meta.device.1.unsigned_abs() as f32,
+    );
+    if dw <= 0.0 || dh <= 0.0 || bounds.width() >= dw * 0.5 || bounds.height() >= dh * 0.5 {
+        return None;
+    }
+    Some(bounds)
+}
+
+/// Convert a properties rectangle to a PDF placement.
+fn area_place((x, y, w, h): (u32, u32, u32, u32), ph: f32) -> Place {
+    const PT: f32 = 72.0 / 2540.0;
+    Place {
+        x: x as f32 * PT,
+        top: y as f32 * PT,
+        w: w as f32 * PT,
+        h: h as f32 * PT,
+        ph,
+    }
+}
+
+/// Embed a JPEG page body into an arbitrary displayed-page rectangle.
+fn draw_jpeg_at(
+    w: &mut Writer,
+    data: &[u8],
+    page: &Page,
+    place: Place,
+    tag: &str,
+    out: &mut String,
+    xobjects: &mut String,
+) -> bool {
+    let PageData::Jpeg { offset, len } = page.data else {
+        return false;
+    };
+    let Some(stream) = data.get(offset..offset.saturating_add(len)) else {
+        return false;
+    };
+    let info = jpeg::info(stream);
+    let (width, height) = info
+        .map(|i| (i.width, i.height))
+        .or(page.pixels)
+        .unwrap_or((1, 1));
+    let space = match info.map(|i| i.components).unwrap_or(3) {
+        1 => "/DeviceGray",
+        4 => "/DeviceCMYK",
+        _ => "/DeviceRGB",
+    };
+    let id = w.add_stream(
+        format!(
+            "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} \
+             /ColorSpace {space} /BitsPerComponent 8 /Filter /DCTDecode >>"
+        ),
+        stream,
+    );
+    let name = format!("{tag}Im");
+    xobjects.push_str(&format!("/{name} {id} 0 R "));
+    let bottom = (place.ph - place.top - place.h).max(0.0);
+    out.push_str(&format!(
+        "q {:.2} 0 0 {:.2} {:.2} {:.2} cm /{name} Do Q\n",
+        place.w, place.h, place.x, bottom
+    ));
+    true
+}
+
+/// Draw a supplied overlay list over a page.
+#[allow(clippy::too_many_arguments)]
+fn draw_overlay_list<D: PageDecoder + ?Sized>(
     w: &mut Writer,
     data: &[u8],
     doc: &Document,
     p: &Page,
+    overlays: &[Overlay],
     decoder: &D,
     pw: f32,
     ph: f32,
@@ -1738,7 +2216,7 @@ fn draw_overlays<D: PageDecoder + ?Sized>(
         group.push(p);
         group.sort_by_key(|q| q.index);
     }
-    for (n, overlay) in p.overlays.iter().enumerate() {
+    for (n, overlay) in overlays.iter().enumerate() {
         let Some(meta) = decoder.decode_overlay(overlay, paper) else {
             continue;
         };
@@ -1752,13 +2230,12 @@ fn draw_overlays<D: PageDecoder + ?Sized>(
                 ph,
             },
         };
-        // Legacy kind-1 WMFs carry point-sized text in their own coordinate
+        // Text-only WMFs carry point-sized text in their own coordinate
         // system. Their properties rectangle is the anchor, not a scale box;
         // using it as the WMF frame shrinks a 12-point label to a few points.
         // Keep the anchor and use one PDF point per WMF device unit.
-        if overlay.kind == 1 && overlay.area.is_some() && !meta.text.is_empty() {
-            place.w = meta.device.0.max(1) as f32;
-            place.h = meta.device.1.max(1) as f32;
+        if is_point_sized_text(overlay, &meta) {
+            place = fit_text_place(place, &meta);
         }
         let stored: &[&Page] = if overlay.area.is_none() { &group } else { &[] };
         let d = draw_page(
@@ -1780,6 +2257,60 @@ fn draw_overlays<D: PageDecoder + ?Sized>(
         total.painted |= d.painted;
     }
     total
+}
+
+/// Some annotation records use their properties rectangle only as an anchor.
+/// A text-only metafile is safe to identify this way; records containing
+/// artwork must continue to scale to their declared rectangle.
+fn is_point_sized_text(overlay: &Overlay, meta: &Metafile) -> bool {
+    overlay.area.is_some()
+        && !meta.text.is_empty()
+        && meta.images.is_empty()
+        && meta.rasters.is_empty()
+        && meta.fills.is_empty()
+        && meta.shapes.is_empty()
+}
+
+/// Fit text-only annotation contents to their properties rectangle.  Some
+/// exporters give the drawing a square frame even though the actual text is a
+/// single line; fitting the frame would either make that line unreadably small
+/// or, if the frame is treated as device-sized, absurdly large.
+fn fit_text_place(mut place: Place, meta: &Metafile) -> Place {
+    let (ux, uy) = meta.units_per_point();
+    let Some((right, top, bottom)) = text_bounds(meta) else {
+        return place;
+    };
+    let text_w = right / ux;
+    let text_h = (bottom - top) / uy;
+    if !(text_w > 0.0 && text_h > 0.0 && place.w > 0.0 && place.h > 0.0) {
+        return place;
+    }
+    let fit = (place.w / text_w).min(place.h / text_h);
+    let (mw, mh) = meta.points();
+    if fit.is_finite() && fit > 0.0 && mw > 0.0 && mh > 0.0 {
+        place.w = mw * fit;
+        place.h = mh * fit;
+    }
+    place
+}
+
+/// Approximate the occupied bounds of the text runs in device units.
+fn text_bounds(meta: &Metafile) -> Option<(f32, f32, f32)> {
+    let mut right = 0.0f32;
+    let mut top = f32::INFINITY;
+    let mut bottom = f32::NEG_INFINITY;
+    for run in &meta.text {
+        for (i, ch) in run.chars.iter().enumerate() {
+            let x = run.xs.get(i).copied().unwrap_or(0.0);
+            let width = run.size * if (*ch as u32) < 0x100 { 0.55 } else { 1.0 };
+            if x.is_finite() && width.is_finite() && run.size.is_finite() && run.y.is_finite() {
+                right = right.max(x + width);
+                top = top.min(run.y - run.size);
+                bottom = bottom.max(run.y);
+            }
+        }
+    }
+    (right > 0.0 && top.is_finite() && bottom.is_finite()).then_some((right, top, bottom))
 }
 
 fn colour((r, g, b): (u8, u8, u8)) -> String {
@@ -2255,6 +2786,8 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::mask_alpha;
+    use super::{oriented_place, pdf_paper_points, Place};
+    use crate::domain::rendering::Metafile;
     use crate::domain::rendering::Raster;
 
     #[test]
@@ -2284,5 +2817,41 @@ mod tests {
             stencil: Some((0, 0, 0)),
         };
         assert_eq!(mask_alpha(&mask, 2, 1), Some(vec![255, 0]));
+    }
+
+    #[test]
+    fn paper_boxes_match_the_print_grid_and_recover_near_a4_frames() {
+        let a4 = pdf_paper_points(Some((21_000, 29_700))).expect("A4");
+        assert!((a4.0 - 595.32).abs() < 0.01);
+        assert!((a4.1 - 841.92).abs() < 0.01);
+
+        let near_a4 = pdf_paper_points(Some((20_997, 29_692))).expect("near A4");
+        assert!((near_a4.0 - 595.32).abs() < 0.01);
+        assert!((near_a4.1 - 841.92).abs() < 0.01);
+
+        let custom = pdf_paper_points(Some((10_000, 14_800))).expect("custom");
+        assert!((custom.0 - 283.44).abs() < 0.01);
+        assert!((custom.1 - 419.52).abs() < 0.01);
+    }
+
+    #[test]
+    fn rotated_display_content_uses_the_swapped_metafile_frame() {
+        let meta = Metafile {
+            device: (7016, 9921),
+            frame_mm100: (29700, 42000),
+            ..Default::default()
+        };
+        let target = Place::sheet(1190.52, 841.92);
+        let (local, matrix) = oriented_place(target, &meta, 90);
+
+        assert!((local.w - 841.89).abs() < 0.1);
+        assert!((local.h - 1190.55).abs() < 0.1);
+        let matrix = matrix.expect("quarter-turn matrix");
+        assert_eq!(
+            (matrix.a, matrix.b, matrix.c, matrix.d),
+            (0.0, -1.0, 1.0, 0.0)
+        );
+        assert!((matrix.e - 0.0).abs() < 0.01);
+        assert!((matrix.f - 841.92).abs() < 0.01);
     }
 }

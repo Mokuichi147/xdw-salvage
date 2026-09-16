@@ -11,7 +11,7 @@ DocuWorks 形式（`.xdw` / `.xbd`）のコンテナを解析し、ベンダー�
 | ページ画像 | 回収可能な JPEG（通常形式とネスト形式）を再エンコードせず、バイト単位で取り出す |
 | 同梱された元ファイル | PDF、docx / xlsx / pptx、旧 Office 形式などを切り出す |
 | ページ本文・図版 | ベンダー独自符号化を展開し、中の EMF / WMF を再現する。文字、画像配置、埋め込み DIB の帯、罫線・塗り、輪郭パスによるクリップ・塗り・縁取り、太字・下線 |
-| 回転・注釈 | 文書プロパティから表示用紙・回転角を読み、画像ページに重なる図形や注釈（テキスト・矩形）を描く |
+| 回転・注釈 | 文書プロパティから表示用紙・回転角・配置階層を読み、複数の内部紙面を1枚の表示ページへ合成し、図形や注釈を描く |
 | PDF / HTML | 回収結果を PDF または外部ファイルに依存しない HTML にまとめる |
 | 移行監査 | 構造表示、期待ページ数の算出、変換後のページ数照合、資産分類を行う |
 
@@ -84,7 +84,7 @@ xdw-salvage verify   <FILE.xdw> --pages <N> 変換後のページ数を照合す
 - 同梱された元ファイルは既定で PDF 添付になります。独自符号化のページが多い場合は `--carry-source` を併用すると原本も一緒に保持できます。
 - EMF から復元した文字は検索・コピーできます。`--font` を省略すると日本語システムフォント（Windowsでは `MS-Mincho`）を参照するため、フォント本体はPDFに入りません。配布先のフォント環境に依存しないPDFが必要な場合は、使用グリフだけを埋め込む `--font` を指定してください。
 - `--font` で指定したフォントは出力PDFに埋め込まれます。フォントファイルのライセンスが埋め込み・PDFの再配布を許可しているかは、利用者が確認してください。フォントファイル自体は本プロジェクトに同梱していません。
-- ページサイズは入力の宣言値を使います。`--paper a4` や `--paper letter` を指定すると全ページを統一できます。
+- ページサイズは入力の宣言値を使います。PDFの標準用紙はWindows印刷出力と同じ600dpi境界へ丸め、画像由来の標準用紙からの微小な寸法ずれも補正します。任意の用紙サイズは保持されます。`--paper a4` や `--paper letter` を指定すると全ページを統一できます。
 
 ### HTML
 
@@ -146,6 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - 画像は再エンコードしません。埋め込み DIB は zlib 圧縮で `FlateDecode`（PDF）/ PNG（HTML）に格納します。
 - 対応していないもの：破線などのペンスタイル、`DWc` の部分矩形（行方向以外）、WMF で送り幅を持たない文字列の正確な字送り。
 - 回収できないページは推測で埋めず、`info` や出力レポートで明示します。
+- コンテナ世代11は、保護情報を持たない通常コンテナに限り世代10相当として読み取ります。`SECU` セキュリティ記述を持つ保護・署名文書は、認証情報なしに内容を復号できないため明示的に拒否します。
 - パスワード保護・電子署名付きの文書は対象外です。アクセス制御を迂回する機能は実装していません。
 - 壊れた入力や未知の形式は、成功またはエラーとして扱い、パニック・無限ループ・過大なメモリ確保を避けます。
 
@@ -168,6 +169,6 @@ cargo doc --no-deps
 
 ## English summary
 
-`xdw-salvage` reads DocuWorks `.xdw` / `.xbd` containers and salvages data without the vendor's software: JPEG pages byte for byte, embedded source files, and printer-driver pages redrawn from the EMF or WMF inside their vendor coding (text, pictures, embedded bitmaps, fills, clip paths and outlines), with page rotation and annotations taken from the document properties. It can write PDF or self-contained HTML and provides commands for inventory and migration checks. Protected and signed documents are refused; no access-control bypass is implemented.
+`xdw-salvage` reads DocuWorks `.xdw` / `.xbd` containers and salvages data without the vendor's software: JPEG pages byte for byte, embedded source files, and printer-driver pages redrawn from the EMF or WMF inside their vendor coding (text, pictures, embedded bitmaps, fills, clip paths and outlines), with displayed-page composition, rotation and annotations taken from the document properties. It can write PDF or self-contained HTML and provides commands for inventory and migration checks. Ordinary generation-11 containers are supported; protected and signed documents are refused because no access-control bypass is implemented.
 
 DocuWorks is a registered trademark or trademark of FUJIFILM Business Innovation Corp. `xdw-salvage` is an unofficial project and is not affiliated with, approved, supported, or endorsed by FUJIFILM Business Innovation Corp.

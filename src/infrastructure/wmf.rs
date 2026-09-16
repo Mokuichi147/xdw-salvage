@@ -10,6 +10,8 @@ use crate::infrastructure::gdi::{i16_at, rgb, u16_at, u32_at, Canvas, Font, Obje
 const HEADER_WORDS: usize = 9;
 
 const META_SETBKMODE: u16 = 0x0102;
+const META_SAVEDC: u16 = 0x001E;
+const META_RESTOREDC: u16 = 0x0127;
 const META_SETPOLYFILLMODE: u16 = 0x0106;
 const META_SETTEXTALIGN: u16 = 0x012E;
 const META_SETTEXTCOLOR: u16 = 0x0209;
@@ -63,8 +65,6 @@ pub fn read(d: &[u8], paper_mm100: (i32, i32)) -> Option<Metafile> {
     c.page.records = u16_at(d, 14).map(u32::from).unwrap_or(0);
     // Object slots: a create takes the lowest free one.
     let mut slots: Vec<bool> = Vec::new();
-    let mut moved: (i32, i32) = (0, 0);
-
     let mut at = HEADER_WORDS * 2;
     let mut guard = d.len() / 6 + 2;
     while at + 6 <= d.len() && guard > 0 {
@@ -78,6 +78,12 @@ pub fn read(d: &[u8], paper_mm100: (i32, i32)) -> Option<Metafile> {
         let p = |i: usize| i16_at(r, 6 + i * 2).map(i32::from);
         match kind {
             META_EOF => break,
+            META_SAVEDC => c.save_state(),
+            META_RESTOREDC => {
+                if let Some(level) = i16_at(r, 6).map(i32::from) {
+                    c.restore_state(level);
+                }
+            }
             META_SETWINDOWORG => {
                 if let (Some(y), Some(x)) = (p(0), p(1)) {
                     c.set_window_org(x, y);
@@ -192,13 +198,12 @@ pub fn read(d: &[u8], paper_mm100: (i32, i32)) -> Option<Metafile> {
             }
             META_MOVETO => {
                 if let (Some(y), Some(x)) = (p(0), p(1)) {
-                    moved = (x, y);
+                    c.move_to(x, y);
                 }
             }
             META_LINETO => {
                 if let (Some(y), Some(x)) = (p(0), p(1)) {
-                    c.polygon(&[moved, (x, y)], false);
-                    moved = (x, y);
+                    c.line_to(x, y);
                 }
             }
             META_STRETCHDIB => {

@@ -1,10 +1,34 @@
 //! 文書全体を表すドメインモデル。
 
 use super::coverage::Coverage;
-use super::page::{Page, Role};
+use super::page::{Area, Overlay, Page, Role};
 
 /// このクレートが検証済みのコンテナ世代。
-pub const SUPPORTED_GENERATIONS: &[u32] = &[7, 10];
+///
+/// 世代11は通常コンテナのみ対象で、保護文書はパーサーで拒否する。
+pub const SUPPORTED_GENERATIONS: &[u32] = &[7, 10, 11];
+
+/// プロパティブロックが記録する、1枚の表示ページ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayPage {
+    /// 表示用紙の幅・高さ（100分の1ミリメートル）。
+    pub paper: Option<(u32, u32)>,
+    /// 表示時の時計回り回転。
+    pub rotation: u16,
+    /// 表示ページに重なる注釈。
+    pub overlays: Vec<Overlay>,
+    /// 表示ページを構成するページ本体の位置。
+    pub members: Vec<DisplayMember>,
+}
+
+/// 表示ページ上に置かれるページテーブル要素。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayMember {
+    /// `Document.pages` 内のインデックス。
+    pub page_index: usize,
+    /// 表示ページ上の位置。未取得時はページ全体。
+    pub area: Option<Area>,
+}
 
 /// XDWコンテナから抽出された文書モデル。
 #[derive(Debug, Clone)]
@@ -20,6 +44,10 @@ pub struct Document {
     /// トレーラーが宣言するエントリ数。プレビューも含む。
     pub declared_entries: u32,
     pub pages: Vec<Page>,
+    /// 文書プロパティから復元した表示ページの構成。
+    ///
+    /// 空の場合は、ページテーブルの本文ページを1枚ずつ表示する。
+    pub display_pages: Vec<DisplayPage>,
     /// 文書プロパティブロックのオフセットと長さ。
     pub properties: Option<(usize, usize)>,
     /// プロパティブロックの保存長と展開長。

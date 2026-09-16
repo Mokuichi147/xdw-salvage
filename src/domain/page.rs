@@ -3,6 +3,18 @@
 /// このプロジェクトで確認済みの圧縮方式コード。
 const KNOWN_COMPRESSION: u64 = 1;
 
+/// XDWプロパティに記録された配置矩形。
+pub type Area = (u32, u32, u32, u32);
+
+/// 1枚の表示ページに置かれるページ本体の位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagePlacement {
+    /// 表示ページ上の x, y, 幅, 高さ（100分の1ミリメートル）。
+    pub area: Area,
+    /// 配置されるページ本体が持つ元のフレーム（100分の1ミリメートル）。
+    pub frame: Option<(u32, u32)>,
+}
+
 /// ページデータの保存形態。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PageData {

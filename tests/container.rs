@@ -138,6 +138,17 @@ fn preview_page() -> Vec<u8> {
 
 /// Assemble a whole file around the given page elements.
 fn container(generation: u8, trailer_tag: u8, pages: Vec<Vec<u8>>, extra: &[u8]) -> Vec<u8> {
+    container_with_trailer(generation, trailer_tag, pages, extra, &[])
+}
+
+/// Assemble a container with additional fields in its trailer.
+fn container_with_trailer(
+    generation: u8,
+    trailer_tag: u8,
+    pages: Vec<Vec<u8>>,
+    extra: &[u8],
+    trailer_extra: &[u8],
+) -> Vec<u8> {
     let mut header_fields = elem(0x82, &[generation]);
     header_fields.extend_from_slice(&elem(0x80, &[0x00, 0xC0, 0x13]));
     header_fields.extend_from_slice(&elem(0x83, &[0x01, 0x0D, 0x0A, 0x01]));
@@ -178,6 +189,7 @@ fn container(generation: u8, trailer_tag: u8, pages: Vec<Vec<u8>>, extra: &[u8])
         trailer_fields.extend_from_slice(&elem(0x83, &32u16.to_be_bytes()));
         trailer_fields.extend_from_slice(&elem(0x84, &8u16.to_be_bytes()));
         trailer_fields.extend_from_slice(&elem(0x85, &[0xAA, 0xBB, 0xCC, 0xDD]));
+        trailer_fields.extend_from_slice(trailer_extra);
         let self_len = trailer_fields.len() + 6;
         trailer_fields.extend_from_slice(&elem(0x86, &(self_len as u32).to_le_bytes()));
         assert_eq!(trailer_fields.len(), self_len);
@@ -303,6 +315,30 @@ fn older_generation_uses_its_own_trailer_tag() {
     let doc = parse(&file).expect("parses");
     assert_eq!(doc.generation, 7);
     assert_eq!(doc.trailer_tag, 0x65);
+}
+
+#[test]
+fn generation_11_without_security_uses_the_common_container_layout() {
+    let file = container(11, 0x68, vec![jpeg_page(100, 100)], &[]);
+    let doc = parse(&file).expect("unprotected generation 11 parses");
+    assert_eq!(doc.generation, 11);
+    assert_eq!(doc.pages.len(), 1);
+    assert!(doc.pages[0].is_recoverable());
+}
+
+#[test]
+fn generation_11_security_marker_is_reported_as_protected() {
+    let file = container_with_trailer(
+        11,
+        0x68,
+        vec![jpeg_page(100, 100)],
+        &[],
+        &elem(0x88, b"SECU003\0"),
+    );
+    assert!(matches!(
+        parse(&file),
+        Err(xdw_salvage::Error::ProtectedDocument)
+    ));
 }
 
 #[test]

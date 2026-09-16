@@ -6,7 +6,7 @@
 //! a first byte whose low five bits are all set is followed by continuation
 //! bytes. Values are lists of length-prefixed big-endian integers.
 
-use crate::domain::page::Overlay;
+use crate::domain::page::{Overlay, PagePlacement};
 use crate::infrastructure::tlv;
 
 const RECORD: u8 = 0x62;
@@ -36,6 +36,10 @@ pub struct PageInfo {
     /// Drawings laid over the page: the page's own overlay first, then any
     /// annotations, each with its position.
     pub overlays: Vec<Overlay>,
+    /// Page-table bodies placed on this displayed page.  A document-merge
+    /// page can contain several such bodies, while ordinary documents usually
+    /// contain only one.
+    pub placements: Vec<PagePlacement>,
 }
 
 /// Per-page display attributes, in page order.
@@ -59,13 +63,14 @@ pub fn pages(block: &[u8]) -> Vec<PageInfo> {
                     paper: field(PAPER).and_then(pair),
                     rotation: 0,
                     overlays: Vec::new(),
+                    placements: Vec::new(),
                 });
                 expecting_content = true;
                 child = None;
             }
             Some(LEVEL_CHILD) => {
                 child = match (
-                    field(CHILD_POSITION).and_then(pair),
+                    field(CHILD_POSITION).and_then(position),
                     field(CHILD_SIZE).and_then(pair),
                 ) {
                     (Some((x, y)), Some((w, h))) => Some((x, y, w, h)),
@@ -85,16 +90,20 @@ pub fn pages(block: &[u8]) -> Vec<PageInfo> {
                     if let Some(r) = field(ROTATION).and_then(|v| ints(v).first().copied()) {
                         page.rotation = (r % 360) as u16;
                     }
-                    if page.paper.is_none() {
-                        page.paper = field(PAPER).and_then(pair);
-                    }
-                    if let Some(o) = field(DRAWING).and_then(|v| drawing(v, area)) {
-                        page.overlays.push(o);
-                    }
-                } else if let Some(o) = field(DRAWING).and_then(|v| drawing(v, area)) {
-                    // An annotation: its drawing sits in the box the child
-                    // record before it announced.
+                }
+                if let Some(o) = field(DRAWING).and_then(|v| drawing(v, area)) {
+                    // An annotation (or a page-owned drawing): its drawing
+                    // sits in the box the child record before it announced.
                     page.overlays.push(o);
+                } else if let Some(area) = area {
+                    // A level-4 record without a drawing field is a reference
+                    // to a page-table body.  Keeping this distinction is what
+                    // lets DocuMerge pages be composed instead of emitted as
+                    // a run of unrelated small pages.
+                    page.placements.push(PagePlacement {
+                        area,
+                        frame: field(PAPER).and_then(pair),
+                    });
                 }
             }
             _ => {}
@@ -181,6 +190,16 @@ fn pair(v: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
+/// A child position may legitimately start at the page origin, unlike a
+/// paper or size whose dimensions must be positive.
+fn position(v: &[u8]) -> Option<(u32, u32)> {
+    let list = ints(v);
+    match list.as_slice() {
+        [x, y, ..] if *x < 1 << 32 && *y < 1 << 32 => Some((*x as u32, *y as u32)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,11 +234,13 @@ mod tests {
                     paper: Some((42000, 29700)),
                     rotation: 90,
                     overlays: Vec::new(),
+                    placements: Vec::new(),
                 },
                 PageInfo {
                     paper: Some((21000, 29700)),
                     rotation: 0,
                     overlays: Vec::new(),
+                    placements: Vec::new(),
                 }
             ]
         );
@@ -256,6 +277,29 @@ mod tests {
         assert_eq!(overlays[0].coded, vec![7, 8, 9]);
         assert_eq!(overlays[0].expanded, 10);
         assert_eq!(overlays[1].area, Some((1000, 2000, 300, 400)));
+        assert!(pages[0].placements.is_empty());
+    }
+
+    #[test]
+    fn a_content_record_without_drawing_is_a_page_placement() {
+        let mut block = record(&[&[0x80, 1, 2]]);
+        block.extend(record(&[
+            &[0x80, 1, 3],
+            &[0x9F, 0x34, 6, 2, 0x03, 0xE8, 2, 0x07, 0xD0],
+            &[0x9F, 0x8F, 0x51, 6, 2, 0x01, 0x2C, 2, 0x01, 0x90],
+        ]));
+        block.extend(record(&[
+            &[0x80, 1, 4],
+            &[0x85, 6, 2, 0x01, 0xF4, 2, 0x02, 0x58],
+        ]));
+        let parsed = pages(&block);
+        assert_eq!(
+            parsed[0].placements,
+            vec![PagePlacement {
+                area: (1000, 2000, 300, 400),
+                frame: Some((500, 600)),
+            }]
+        );
     }
 
     #[test]

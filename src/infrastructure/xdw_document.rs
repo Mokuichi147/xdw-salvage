@@ -1,7 +1,9 @@
 //! XDWコンテナをドメインの文書モデルへ変換するパーサー。
 
-use crate::domain::document::{Document, Rebuilt, SUPPORTED_GENERATIONS};
-use crate::domain::page::{Page, PageData, Role};
+use crate::domain::document::{
+    DisplayMember, DisplayPage, Document, Rebuilt, SUPPORTED_GENERATIONS,
+};
+use crate::domain::page::{Page, PageData, PagePlacement, Role};
 use crate::error::{Error, Result};
 use crate::infrastructure::tlv::{self, Tlv};
 
@@ -19,6 +21,7 @@ const TR_PROPS_EXPANDED: u8 = 0x83;
 const TR_PROPS_STORED: u8 = 0x84;
 const TR_CHECKSUM: u8 = 0x85;
 const TR_SELF_LEN: u8 = 0x86;
+const TR_SECURITY: u8 = 0x88;
 const TR_IMAGE_PAGES: u8 = 0x8D;
 
 /// XDWファイル全体を解析する。
@@ -51,6 +54,9 @@ pub fn parse(data: &[u8]) -> Result<Document> {
     }
 
     let (trailer, fields) = read_trailer(data)?;
+    if generation == 11 && is_protected(&fields, data) {
+        return Err(Error::ProtectedDocument);
+    }
     let declared_entries = tlv::find_uint(&fields, data, TR_PAGE_COUNT).unwrap_or(0) as u32;
     let offsets = tlv::find(&fields, TR_PAGE_OFFSETS).map(|t| tlv::le_u32s(t.bytes(data)));
 
@@ -111,49 +117,45 @@ pub fn parse(data: &[u8]) -> Result<Document> {
     } else {
         Vec::new()
     };
-    let mut sheets = pages.iter_mut().filter(|p| p.is_sheet());
-    for info in &shown {
-        let Some(sheet) = sheets.next() else { break };
-        sheet.rotation = info.rotation;
-        if sheet.paper.is_none() {
-            sheet.paper = info.paper;
-        }
-        sheet.overlays = info.overlays.clone();
-    }
-    // A few older exports retain the complete display description in the
-    // properties block but omit the page-offset field from their trailer. In
-    // that case the properties are the only trustworthy page table: preserve
-    // each described page as a synthetic sheet so its bitmap/text overlays can
-    // still be rendered. No bytes outside the properties block are guessed as
-    // page data.
-    if pages.is_empty() && offsets.is_none() {
+    // A few exports retain the complete display description in the properties
+    // block but omit or invalidate the page-offset field from their trailer.
+    // In that case the properties are the only trustworthy page table:
+    // preserve each described page as a synthetic sheet so its bitmap/text
+    // overlays can still be rendered. No bytes outside the properties block
+    // are guessed as page data.
+    if pages.is_empty() {
         if shown.is_empty() {
-            return Err(Error::MissingField {
-                tag: TR_PAGE_OFFSETS,
-                in_tag: trailer.tag,
-            });
-        }
-        pages = shown
-            .into_iter()
-            .enumerate()
-            .map(|(index, info)| Page {
-                index,
-                role: Role::Sheet,
-                belongs_to: None,
-                offset: trailer.start,
-                checksum: None,
-                paper: info.paper,
-                pixels: None,
-                rotation: info.rotation,
-                overlays: info.overlays,
-                data: PageData::Bare {
+            if offsets.is_none() {
+                return Err(Error::MissingField {
+                    tag: TR_PAGE_OFFSETS,
+                    in_tag: trailer.tag,
+                });
+            }
+        } else {
+            pages = shown
+                .iter()
+                .enumerate()
+                .map(|(index, info)| Page {
+                    index,
+                    role: Role::Sheet,
+                    belongs_to: None,
                     offset: trailer.start,
-                    len: 0,
-                },
-                unknown_fields: Vec::new(),
-            })
-            .collect();
+                    checksum: None,
+                    paper: info.paper,
+                    pixels: None,
+                    rotation: info.rotation,
+                    overlays: info.overlays.clone(),
+                    data: PageData::Bare {
+                        offset: trailer.start,
+                        len: 0,
+                    },
+                    unknown_fields: Vec::new(),
+                })
+                .collect();
+        }
     }
+
+    let display_pages = apply_display_layout(&mut pages, &shown);
 
     let (generations_present, unknown_tags) = survey(data);
 
@@ -164,6 +166,7 @@ pub fn parse(data: &[u8]) -> Result<Document> {
         trailer_at: trailer.start,
         declared_entries,
         pages,
+        display_pages,
         properties,
         properties_len: match (stored, expanded) {
             (Some(s), Some(e)) => Some((s, e)),
@@ -175,6 +178,191 @@ pub fn parse(data: &[u8]) -> Result<Document> {
         unknown_tags,
         rebuilt,
     })
+}
+
+/// Apply the display hierarchy from the properties block to the page table.
+///
+/// A level-2 properties record is a logical displayed page.  Its level-3/4
+/// children without a drawing field are references to page-table bodies; the
+/// other level-4 children are inline annotation drawings.  The page table may
+/// also contain old bodies left by a saved-over document, so references are
+/// matched by their native frame when possible rather than blindly taking the
+/// first entries.
+fn apply_display_layout(
+    pages: &mut [Page],
+    shown: &[crate::infrastructure::xdw_properties::PageInfo],
+) -> Vec<DisplayPage> {
+    if shown.is_empty() {
+        return Vec::new();
+    }
+    let sheet_indices: Vec<usize> = pages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, page)| page.is_sheet().then_some(i))
+        .collect();
+    let placements = shown
+        .iter()
+        .map(|info| info.placements.len())
+        .sum::<usize>();
+    let meaningful_sheets = sheet_indices
+        .iter()
+        .filter(|&&index| {
+            !matches!(pages[index].data, PageData::Bare { .. })
+                || pages[index].paper.is_some()
+                || pages[index].pixels.is_some()
+        })
+        .count();
+    // A saved-over file can retain opaque, old page bodies in the table.  A
+    // single current properties page with one reference is still trustworthy
+    // in that shape.  Conversely, when the properties contain more logical
+    // pages than current page bodies, do not invent a repeated page layout.
+    let trustworthy = shown.len() == sheet_indices.len()
+        || (shown.len() == 1 && placements == sheet_indices.len())
+        || (shown.len() == 1 && placements > 0 && meaningful_sheets <= placements);
+    if !trustworthy {
+        apply_page_attributes(pages, shown);
+        return Vec::new();
+    }
+    let mut used = vec![false; pages.len()];
+    let mut result = Vec::with_capacity(shown.len());
+    let mut fallback = 0usize;
+
+    for info in shown {
+        let mut members = Vec::new();
+        for placement in &info.placements {
+            let picked = pick_sheet(pages, &sheet_indices, &used, placement, fallback);
+            let Some(index) = picked else { continue };
+            used[index] = true;
+            fallback = sheet_indices
+                .iter()
+                .position(|&candidate| candidate == index)
+                .map_or(fallback, |position| position + 1);
+            members.push(DisplayMember {
+                page_index: index,
+                area: Some(placement.area),
+            });
+        }
+        // A normal one-sheet document can omit the child placement while its
+        // properties still describe rotation and paper.  Keep that page in
+        // the display model instead of making the layout appear empty.
+        if members.is_empty() {
+            if let Some(&index) = sheet_indices
+                .iter()
+                .skip(fallback)
+                .find(|&&candidate| !used[candidate])
+                .or_else(|| sheet_indices.iter().find(|&&candidate| !used[candidate]))
+            {
+                used[index] = true;
+                members.push(DisplayMember {
+                    page_index: index,
+                    area: None,
+                });
+            }
+        }
+
+        if let Some(anchor) = members.first().map(|member| member.page_index) {
+            let page = &mut pages[anchor];
+            page.rotation = info.rotation;
+            // Keep the page body's native frame on `Page`; the properties
+            // paper belongs to `DisplayPage` and can be much larger for a
+            // DocuMerge composition.
+            page.overlays = info.overlays.clone();
+        }
+
+        result.push(DisplayPage {
+            paper: resolved_display_paper(info.paper, info.rotation, pages, &members),
+            rotation: info.rotation,
+            overlays: info.overlays.clone(),
+            members,
+        });
+    }
+    result
+}
+
+/// 表示属性の用紙寸法は、保存形式や出力元によって整数ミリ単位へ丸められる
+/// ことがある。本文ページが1枚だけの通常ページなら、そのページ本体の寸法を
+/// 優先してPDF/HTMLの用紙サイズを保つ。複数本体を合成する表示ページでは、
+/// 親の用紙が本来のキャンバスなので、プロパティの寸法をそのまま使う。
+fn resolved_display_paper(
+    declared: Option<(u32, u32)>,
+    rotation: u16,
+    pages: &[Page],
+    members: &[DisplayMember],
+) -> Option<(u32, u32)> {
+    if members.len() != 1 {
+        return declared;
+    }
+    let native = pages
+        .get(members[0].page_index)
+        .and_then(|page| page.paper)
+        .map(|(w, h)| if rotation % 180 == 90 { (h, w) } else { (w, h) });
+    let Some(native) = native else {
+        return declared;
+    };
+    let close = |a: u32, b: u32| a.abs_diff(b) <= 100;
+    match declared {
+        Some((w, h)) if close(w, native.0) && close(h, native.1) => Some(native),
+        Some(_) => declared,
+        None => Some(native),
+    }
+}
+
+/// Preserve the historical one-to-one properties mapping when a container's
+/// saved-over hierarchy is too ambiguous to compose safely.
+fn apply_page_attributes(
+    pages: &mut [Page],
+    shown: &[crate::infrastructure::xdw_properties::PageInfo],
+) {
+    let mut sheets = pages.iter_mut().filter(|page| page.is_sheet());
+    for info in shown {
+        let Some(page) = sheets.next() else { break };
+        page.rotation = info.rotation;
+        if info.paper.is_some() {
+            page.paper = info.paper;
+        }
+        page.overlays = info.overlays.clone();
+    }
+}
+
+/// Pick the not-yet-used page body that best matches a properties child.
+fn pick_sheet(
+    pages: &[Page],
+    sheet_indices: &[usize],
+    used: &[bool],
+    placement: &PagePlacement,
+    fallback: usize,
+) -> Option<usize> {
+    let mut best: Option<(f32, usize)> = None;
+    for &index in sheet_indices {
+        if used[index] {
+            continue;
+        }
+        let score = geometry_score(&pages[index], placement.frame);
+        if best.is_none_or(|(old, _)| score < old) {
+            best = Some((score, index));
+        }
+    }
+    best.map(|(_, index)| index).or_else(|| {
+        sheet_indices
+            .iter()
+            .skip(fallback)
+            .copied()
+            .find(|&index| !used[index])
+    })
+}
+
+/// Compare a page body's declared geometry with a properties child frame.
+fn geometry_score(page: &Page, frame: Option<(u32, u32)>) -> f32 {
+    let Some((fw, fh)) = frame else { return 0.0 };
+    if fw == 0 || fh == 0 {
+        return 100.0;
+    }
+    let dims = page.paper.or(page.pixels);
+    let Some((pw, ph)) = dims else { return 100.0 };
+    let ratio_error = |a: f32, b: f32| ((a / b).ln()).abs();
+    let normal = ratio_error(pw as f32, fw as f32) + ratio_error(ph as f32, fh as f32);
+    let turned = ratio_error(pw as f32, fh as f32) + ratio_error(ph as f32, fw as f32);
+    normal.min(turned)
 }
 
 /// XDWコンテナでないファイルの既知形式を判定する。
@@ -430,6 +618,15 @@ fn locate_properties(data: &[u8], trailer_at: usize, stored: usize) -> Option<(u
     None
 }
 
+/// 世代11の保護コンテナに付くセキュリティ記述を判定する。
+///
+/// The security payload is deliberately not interpreted: the clear marker is
+/// enough to distinguish an authorized, ordinary generation-11 container from
+/// a document whose pages are encrypted or signature-bound.
+fn is_protected(fields: &[Tlv], data: &[u8]) -> bool {
+    tlv::find(fields, TR_SECURITY).is_some_and(|t| t.bytes(data).starts_with(b"SECU"))
+}
+
 /// 文書世代数と未解釈要素を集計する。
 fn survey(data: &[u8]) -> (usize, Vec<(u8, usize, usize)>) {
     let mut generations = 0usize;
@@ -452,4 +649,70 @@ fn survey(data: &[u8]) -> (usize, Vec<(u8, usize, usize)>) {
         i = t.end();
     }
     (generations.max(1), unknown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sheet(index: usize, paper: (u32, u32)) -> Page {
+        Page {
+            index,
+            role: Role::Sheet,
+            belongs_to: None,
+            offset: 0,
+            checksum: None,
+            paper: Some(paper),
+            pixels: None,
+            rotation: 0,
+            overlays: Vec::new(),
+            data: PageData::Bare { offset: 0, len: 0 },
+            unknown_fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rounded_display_paper_uses_the_native_single_sheet_size() {
+        let pages = vec![sheet(0, (21590, 27940))];
+        let members = vec![DisplayMember {
+            page_index: 0,
+            area: None,
+        }];
+        assert_eq!(
+            resolved_display_paper(Some((21600, 27900)), 0, &pages, &members),
+            Some((21590, 27940))
+        );
+    }
+
+    #[test]
+    fn rotated_display_paper_follows_the_native_orientation() {
+        let pages = vec![sheet(0, (29700, 42000))];
+        let members = vec![DisplayMember {
+            page_index: 0,
+            area: None,
+        }];
+        assert_eq!(
+            resolved_display_paper(Some((42000, 29700)), 90, &pages, &members),
+            Some((42000, 29700))
+        );
+    }
+
+    #[test]
+    fn composed_display_paper_keeps_the_parent_canvas() {
+        let pages = vec![sheet(0, (10000, 10000)), sheet(1, (10000, 10000))];
+        let members = vec![
+            DisplayMember {
+                page_index: 0,
+                area: None,
+            },
+            DisplayMember {
+                page_index: 1,
+                area: None,
+            },
+        ];
+        assert_eq!(
+            resolved_display_paper(Some((42000, 29700)), 0, &pages, &members),
+            Some((42000, 29700))
+        );
+    }
 }

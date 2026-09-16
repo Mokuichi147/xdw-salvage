@@ -356,6 +356,20 @@ fn comment(body: &[u8]) -> Vec<u8> {
     c
 }
 
+/// An EMF comment record is DWORD-aligned, while `cbData` excludes the
+/// padding at its end.
+fn aligned_comment(body: &[u8]) -> Vec<u8> {
+    let size = 12 + body.len();
+    let padded = (size + 3) & !3;
+    let mut record = Vec::with_capacity(8 + padded);
+    record.extend_from_slice(&70u32.to_le_bytes()); // EMR_GDICOMMENT
+    record.extend_from_slice(&(padded as u32).to_le_bytes());
+    record.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    record.extend_from_slice(body);
+    record.resize(8 + padded, 0);
+    record
+}
+
 /// A private geometry comment: a closed square in 16-bit absolute points.
 fn square_comment(op: u8, side: i16) -> Vec<u8> {
     let mut b = b"DW".to_vec();
@@ -391,6 +405,58 @@ fn fills_inside_a_clip_path_carry_the_outline_they_are_cut_by() {
     assert!(page.fills.iter().all(|f| f.clip_path == Some(0)));
     assert_eq!(page.paths[0].figures.len(), 1);
     assert_eq!(page.paths[0].figures[0].segments.len(), 3);
+}
+
+#[test]
+fn emf_private_path_points_can_follow_the_comment_data_length() {
+    // Some printer drivers put only `DW13` in cbData and append the absolute
+    // 32-bit Bezier points to the same EMF comment record.
+    let mut f = metafile_with_text(b"x", 0, 0);
+    push_record(&mut f, 70, &comment(b"DW02"));
+    let mut path = 4u32.to_le_bytes().to_vec();
+    path.extend_from_slice(b"DW\x13\0");
+    path.extend_from_slice(&4u32.to_le_bytes());
+    for (x, y) in [(10i32, 20i32), (30, 40), (50, 60), (70, 80)] {
+        path.extend_from_slice(&x.to_le_bytes());
+        path.extend_from_slice(&y.to_le_bytes());
+    }
+    push_record(&mut f, 70, &path);
+    push_record(&mut f, 70, &comment(b"DW04"));
+    let page = emf::read(&f).expect("reads");
+    assert_eq!(page.shapes.len(), 1);
+    assert_eq!(page.shapes[0].path.figures.len(), 1);
+    assert_eq!(page.shapes[0].path.figures[0].segments.len(), 1);
+}
+
+#[test]
+fn emf_private_polygon_points_can_follow_the_comment_data_length() {
+    let mut file = metafile_with_text(b"x", 0, 0);
+    let mut polygon = 4u32.to_le_bytes().to_vec();
+    polygon.extend_from_slice(b"DW\x20\x20");
+    polygon.extend_from_slice(&4u32.to_le_bytes());
+    for (x, y) in [(0i16, 0i16), (50, 0), (50, 50), (0, 50)] {
+        polygon.extend_from_slice(&x.to_le_bytes());
+        polygon.extend_from_slice(&y.to_le_bytes());
+    }
+    push_record(&mut file, 70, &polygon);
+
+    let page = emf::read(&file).expect("reads");
+    assert_eq!(page.shapes.len(), 1);
+    assert_eq!(page.shapes[0].path.figures[0].segments.len(), 3);
+}
+
+#[test]
+fn aligned_private_geometry_ignores_record_padding() {
+    let mut file = metafile_with_text(b"x", 0, 0);
+    let mut polygon = b"DW\x20\x80".to_vec();
+    polygon.extend_from_slice(&3u32.to_le_bytes());
+    polygon.extend_from_slice(&[0, 0, 0, 0]); // first point
+    polygon.extend_from_slice(&[0x30, 0x03]); // (+3, 0), then (0, +3)
+    file.extend_from_slice(&aligned_comment(&polygon));
+
+    let page = emf::read(&file).expect("reads");
+    assert_eq!(page.shapes.len(), 1, "comment padding hid the polygon");
+    assert_eq!(page.shapes[0].path.figures[0].segments.len(), 2);
 }
 
 #[test]

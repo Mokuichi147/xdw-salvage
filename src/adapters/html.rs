@@ -10,7 +10,7 @@ use crate::application::recovery;
 use crate::domain::output::Language as Lang;
 use crate::domain::page::{Page, PageData};
 use crate::domain::rendering::{self, Fill, Image, Metafile, Rect, Segment, Shape, Source};
-use crate::domain::Document;
+use crate::domain::{DisplayPage, Document};
 use crate::infrastructure::{png, LzhMetafileDecoder, MagicAttachmentScanner};
 
 /// Settings for [`build`].
@@ -90,18 +90,30 @@ where
     let mut report = Report::default();
     // One card per sheet. Thumbnails and the pictures a sheet is made of are
     // not sheets; listing them as pages would misreport the document's length.
-    let selected: Vec<&Page> = doc
-        .pages
-        .iter()
-        .filter(|p| p.is_sheet() || (opts.include_previews && p.is_preview()))
-        .collect();
+    let display_mode = !doc.display_pages.is_empty();
+    let selected: Vec<&Page> = if display_mode {
+        doc.display_pages
+            .iter()
+            .filter_map(|display| {
+                display
+                    .members
+                    .first()
+                    .and_then(|member| doc.pages.get(member.page_index))
+            })
+            .collect()
+    } else {
+        doc.pages
+            .iter()
+            .filter(|p| p.is_sheet() || (opts.include_previews && p.is_preview()))
+            .collect()
+    };
 
     // A small text-only sheet immediately following a JPEG is a saved
     // drawing layer in some exports.  Keep the HTML page sequence aligned
     // with the PDF adapter by merging that layer onto its image page.
     let mut merged_labels: Vec<Option<Metafile>> = vec![None; selected.len()];
     let mut merge_label = vec![false; selected.len()];
-    if opts.decode {
+    if opts.decode && !display_mode {
         for i in 1..selected.len() {
             let previous = selected[i - 1];
             let label = selected[i];
@@ -127,18 +139,40 @@ where
     let mut body = String::new();
     let mut gaps: Vec<usize> = Vec::new();
     let mut no = 0usize;
-    for (i, p) in selected.iter().enumerate() {
-        if merge_label[i] {
-            continue;
+    if display_mode {
+        for display in &doc.display_pages {
+            no += 1;
+            if let Some((g, d)) =
+                draw_display_sheet(display, data, doc, decoder, opts.decode, no, &t, &mut body)
+            {
+                report.embedded += 1;
+                report.glyphs += g;
+                report.pictures += d;
+            } else if opts.skip_missing {
+                report.skipped += 1;
+            } else {
+                report.gaps += 1;
+                gaps.push(no);
+                body.push_str(&format!(
+                    "<section class=\"page gap\" id=\"p{no}\"><p class=\"no\">{}</p><p class=\"why\">{}</p><p class=\"meta\">display page</p></section>\n",
+                    esc(&t.page_label(no)),
+                    esc(t.gap_why),
+                ));
+            }
         }
-        no += 1;
-        let decoded = opts
-            .decode
-            .then(|| recovery::decode_page(data, p, decoder))
-            .flatten();
-        // A picture page with a drawing of its own is drawn from that
-        // drawing, which places the picture and whatever sits over it.
-        let overlaid = opts.decode
+    } else {
+        for (i, p) in selected.iter().enumerate() {
+            if merge_label[i] {
+                continue;
+            }
+            no += 1;
+            let decoded = opts
+                .decode
+                .then(|| recovery::decode_page(data, p, decoder))
+                .flatten();
+            // A picture page with a drawing of its own is drawn from that
+            // drawing, which places the picture and whatever sits over it.
+            let overlaid = opts.decode
             && !p.overlays.is_empty()
             // A missing page body can still have a complete drawing in the
             // properties block.  A decoded page body is handled together
@@ -154,25 +188,34 @@ where
                     report.pictures += d.saturating_sub(1);
                 })
                 .is_some();
-        if overlaid {
-            continue;
-        }
-        match p.data {
-            PageData::Jpeg { offset, len } if offset + len <= data.len() => {
-                report.embedded += 1;
-                let (w, h) = p.pixels.unwrap_or((0, 0));
-                if let Some(label) = merged_labels.get(i + 1).and_then(Option::as_ref) {
-                    let paper = p.paper.unwrap_or((21000, 29700));
-                    let pw = paper.0 as f32 * 72.0 / 2540.0;
-                    let ph = paper.1 as f32 * 72.0 / 2540.0;
-                    let mut svg = String::new();
-                    let mut spans = String::new();
-                    let place = serial_label_place(label, pw, ph);
-                    let (g, d) =
-                        draw_metafile(label, data, &[], place, "l", no, &t, &mut svg, &mut spans);
-                    report.glyphs += g;
-                    report.pictures += d;
-                    body.push_str(&format!(
+            if overlaid {
+                continue;
+            }
+            match p.data {
+                PageData::Jpeg { offset, len } if offset + len <= data.len() => {
+                    report.embedded += 1;
+                    let (w, h) = p.pixels.unwrap_or((0, 0));
+                    if let Some(label) = merged_labels.get(i + 1).and_then(Option::as_ref) {
+                        let paper = p.paper.unwrap_or((21000, 29700));
+                        let pw = paper.0 as f32 * 72.0 / 2540.0;
+                        let ph = paper.1 as f32 * 72.0 / 2540.0;
+                        let mut svg = String::new();
+                        let mut spans = String::new();
+                        let place = serial_label_place(label, pw, ph);
+                        let (g, d) = draw_metafile(
+                            label,
+                            data,
+                            &[],
+                            place,
+                            "l",
+                            no,
+                            &t,
+                            &mut svg,
+                            &mut spans,
+                        );
+                        report.glyphs += g;
+                        report.pictures += d;
+                        body.push_str(&format!(
                         "<figure class=\"page\" id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet\" style=\"aspect-ratio:{:.4}\">\n<img class=\"art\" style=\"left:0%;top:0%;width:100%;height:100%\" loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n{svg}{spans}</div>\n</div>\n<figcaption>{} &middot; {w}&times;{h}px</figcaption>\n</figure>\n",
                         pw / ph,
                         pw / ph,
@@ -180,61 +223,62 @@ where
                         b64(&data[offset..offset + len]),
                         esc(&t.page_label(no)),
                     ));
-                } else {
-                    body.push_str(&format!(
+                    } else {
+                        body.push_str(&format!(
                         "<figure class=\"page\" id=\"p{no}\">\n<img loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n<figcaption>{} &middot; {w}&times;{h}px</figcaption>\n</figure>\n",
                         esc(&t.page_alt(no)),
                         b64(&data[offset..offset + len]),
                         esc(&t.page_label(no)),
                     ));
+                    }
                 }
-            }
-            // The sheet is in the container's own coding. Expand it and draw
-            // the metafile's text: the page comes back as real, selectable
-            // text rather than a note saying it could not be read. A sheet
-            // that does not expand falls through to the arm below, which still
-            // shows whatever artwork sits on it.
-            PageData::Encoded { .. } if decoded.is_some() => {
-                let m = decoded.as_ref().expect("decoded guard above");
-                report.embedded += 1;
-                if let Some((placed, drawn)) =
-                    draw_sheet(p, Some(m), data, doc, decoder, no, &t, &mut body)
-                {
-                    report.glyphs += placed;
-                    report.pictures += drawn;
+                // The sheet is in the container's own coding. Expand it and draw
+                // the metafile's text: the page comes back as real, selectable
+                // text rather than a note saying it could not be read. A sheet
+                // that does not expand falls through to the arm below, which still
+                // shows whatever artwork sits on it.
+                PageData::Encoded { .. } if decoded.is_some() => {
+                    let m = decoded.as_ref().expect("decoded guard above");
+                    report.embedded += 1;
+                    if let Some((placed, drawn)) =
+                        draw_sheet(p, Some(m), data, doc, decoder, no, &t, &mut body)
+                    {
+                        report.glyphs += placed;
+                        report.pictures += drawn;
+                    }
                 }
-            }
-            _ => {
-                if opts.skip_missing {
-                    report.skipped += 1;
-                    continue;
-                }
-                report.gaps += 1;
-                gaps.push(no);
-                let size = p
-                    .paper
-                    .map(|(w, h)| {
-                        format!("{:.0}&times;{:.0} mm", w as f32 / 100.0, h as f32 / 100.0)
-                    })
-                    .unwrap_or_else(|| "&mdash;".into());
-                // The sheet itself could not be expanded, but the pictures on
-                // it are plain JPEG. Show them: a page comes back as its
-                // artwork instead of an empty box.
-                let (mut art, count) = artwork(data, doc, p.index, no, &t);
-                let images = usize::from(!art.is_empty());
-                report.pictures += count;
-                if images > 0 {
-                    art = format!(
-                        "<p class=\"why art-note\">{}</p>\n<div class=\"arts\">\n{art}</div>\n",
-                        esc(&t.art_note(images))
-                    );
-                }
-                body.push_str(&format!(
+                _ => {
+                    if opts.skip_missing {
+                        report.skipped += 1;
+                        continue;
+                    }
+                    report.gaps += 1;
+                    gaps.push(no);
+                    let size = p
+                        .paper
+                        .map(|(w, h)| {
+                            format!("{:.0}&times;{:.0} mm", w as f32 / 100.0, h as f32 / 100.0)
+                        })
+                        .unwrap_or_else(|| "&mdash;".into());
+                    // The sheet itself could not be expanded, but the pictures on
+                    // it are plain JPEG. Show them: a page comes back as its
+                    // artwork instead of an empty box.
+                    let (mut art, count) = artwork(data, doc, p.index, no, &t);
+                    let images = usize::from(!art.is_empty());
+                    report.pictures += count;
+                    if images > 0 {
+                        art = format!(
+                            "<p class=\"why art-note\">{}</p>\n<div class=\"arts\">\n{art}</div>\n",
+                            esc(&t.art_note(images))
+                        );
+                    }
+                    body.push_str(&format!(
                     "<section class=\"page gap\" id=\"p{no}\">\n<p class=\"no\">{}</p>\n<p class=\"why\">{}</p>\n<p class=\"meta\">{size} &middot; {}</p>\n{art}</section>\n",
                     esc(&t.page_label(no)),
                     esc(t.gap_why),
                     esc(p.kind_name()),
                 ));
+                }
             }
         }
     }
@@ -596,10 +640,30 @@ fn draw_metafile(
     svg: &mut String,
     spans: &mut String,
 ) -> (usize, usize) {
+    draw_metafile_with_viewbox(m, data, stored, place, tag, no, t, svg, spans, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_metafile_with_viewbox(
+    m: &Metafile,
+    data: &[u8],
+    stored: &[&Page],
+    place: Place,
+    tag: &str,
+    no: usize,
+    t: &Text,
+    svg: &mut String,
+    spans: &mut String,
+    viewbox: Option<Rect>,
+) -> (usize, usize) {
     let (dw, dh) = (m.device.0 as f32, m.device.1 as f32);
     if dw <= 0.0 || dh <= 0.0 {
         return (0, 0);
     }
+    let (origin_x, origin_y, view_w, view_h) = viewbox
+        .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+        .map(|r| (r.left, r.top, r.width(), r.height()))
+        .unwrap_or((0.0, 0.0, dw, dh));
     let upright_vertical = m.uses_upright_vertical_text();
     // Pair the stored pictures the page names with the ones beside the sheet.
     let calls: Vec<(usize, (u32, u32))> = {
@@ -623,7 +687,7 @@ fn draw_metafile(
     };
 
     svg.push_str(&format!(
-        "<svg class=\"art\" style=\"left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%\" viewBox=\"0 0 {dw} {dh}\" preserveAspectRatio=\"none\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n",
+        "<svg class=\"art\" style=\"left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%\" viewBox=\"{origin_x} {origin_y} {view_w} {view_h}\" preserveAspectRatio=\"none\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n",
         place.x * 100.0,
         place.y * 100.0,
         place.w * 100.0,
@@ -780,7 +844,7 @@ fn draw_metafile(
         } else {
             run.y
         };
-        let top = place.y + (text_y - size) / dh * place.h;
+        let top = place.y + (text_y - size - origin_y) / view_h * place.h;
         let (r, g, b) = run.rgb;
         let colour = if (r, g, b) == (0, 0, 0) {
             String::new()
@@ -806,14 +870,16 @@ fn draw_metafile(
             if c.is_whitespace() {
                 continue;
             }
-            let left = (place.x + run.xs.get(i).copied().unwrap_or(0.0) / dw * place.w) * 100.0;
+            let left = (place.x
+                + (run.xs.get(i).copied().unwrap_or(0.0) - origin_x) / view_w * place.w)
+                * 100.0;
             let top = top * 100.0;
             if !left.is_finite() || !top.is_finite() {
                 continue;
             }
             spans.push_str(&format!(
                 "<span style=\"left:{left:.3}%;top:{top:.3}%;font-size:{:.3}cqh;{colour}{weight}{line}{turn}\">{}</span>",
-                size / dh * place.h * 100.0,
+                size / view_h * place.h * 100.0,
                 esc(&c.to_string())
             ));
             placed += 1;
@@ -905,12 +971,11 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
                 h: h as f32 * PT / ph,
             },
         };
-        // Legacy kind-1 WMFs carry point-sized text in their own device
+        // Text-only WMFs carry point-sized text in their own device
         // coordinate system.  The properties rectangle is the anchor, not a
         // scale box; keep the same physical sizing used by the PDF adapter.
-        if overlay.kind == 1 && overlay.area.is_some() && !m.text.is_empty() {
-            place.w = m.device.0.max(1) as f32 * PT / pw;
-            place.h = m.device.1.max(1) as f32 * PT / ph;
+        if is_point_sized_text(overlay, &m) {
+            place = fit_text_place(place, &m, pw, ph);
         }
         let stored: &[&Page] = if overlay.area.is_none() { &group } else { &[] };
         let (g, d) = draw_metafile(
@@ -949,6 +1014,219 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
         esc(&t.page_label(no))
     ));
     Some((glyphs, pictures))
+}
+
+/// Draw one logical displayed page whose properties record places several
+/// page-table bodies on a single sheet.
+#[allow(clippy::too_many_arguments)]
+fn draw_display_sheet<D: PageDecoder + ?Sized>(
+    display: &DisplayPage,
+    data: &[u8],
+    doc: &Document,
+    decoder: &D,
+    decode: bool,
+    no: usize,
+    t: &Text,
+    body: &mut String,
+) -> Option<(usize, usize)> {
+    const PT: f32 = 72.0 / 2540.0;
+    let paper = display.paper.unwrap_or((21000, 29700));
+    let (pw, ph) = (paper.0 as f32 * PT, paper.1 as f32 * PT);
+    if pw <= 0.0 || ph <= 0.0 {
+        return None;
+    }
+    let mut svg = String::new();
+    let mut spans = String::new();
+    let mut glyphs = 0usize;
+    let mut pictures = 0usize;
+    let mut recovered = false;
+
+    for (n, member) in display.members.iter().enumerate() {
+        let Some(page) = doc.pages.get(member.page_index) else {
+            continue;
+        };
+        let place = member
+            .area
+            .map(|area| display_area_place(area, pw, ph))
+            .unwrap_or(Place::SHEET);
+        match page.data {
+            PageData::Jpeg { offset, len } if offset + len <= data.len() => {
+                svg.push_str(&format!(
+                    "<img class=\"art\" style=\"left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%\" loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n",
+                    place.x * 100.0,
+                    place.y * 100.0,
+                    place.w * 100.0,
+                    place.h * 100.0,
+                    esc(&t.page_alt(no)),
+                    b64(&data[offset..offset + len]),
+                ));
+                pictures += 1;
+                recovered = true;
+            }
+            PageData::Encoded { .. } if decode => {
+                let Some(meta) = recovery::decode_page(data, page, decoder) else {
+                    continue;
+                };
+                let stored: Vec<&Page> = doc.pictures_on(page.index).collect();
+                let (g, d) = draw_metafile_with_viewbox(
+                    &meta,
+                    data,
+                    &stored,
+                    place,
+                    &format!("d{n}"),
+                    no,
+                    t,
+                    &mut svg,
+                    &mut spans,
+                    member_viewbox(member.area, &meta),
+                );
+                glyphs += g;
+                pictures += d;
+                recovered |= g > 0 || d > 0;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(member) = display.members.first() {
+        if let Some(anchor) = doc.pages.get(member.page_index) {
+            let mut group: Vec<&Page> = doc.pictures_on(anchor.index).collect();
+            if anchor.is_recoverable() {
+                group.push(anchor);
+                group.sort_by_key(|page| page.index);
+            }
+            for (n, overlay) in display.overlays.iter().enumerate() {
+                let Some(meta) = decoder.decode_overlay(overlay, paper) else {
+                    continue;
+                };
+                let mut place = overlay
+                    .area
+                    .map(|area| display_area_place(area, pw, ph))
+                    .unwrap_or(Place::SHEET);
+                if is_point_sized_text(overlay, &meta) {
+                    place = fit_text_place(place, &meta, pw, ph);
+                }
+                let stored: &[&Page] = if overlay.area.is_none() { &group } else { &[] };
+                let (g, d) = draw_metafile(
+                    &meta,
+                    data,
+                    stored,
+                    place,
+                    &format!("do{n}"),
+                    no,
+                    t,
+                    &mut svg,
+                    &mut spans,
+                );
+                glyphs += g;
+                pictures += d;
+                recovered |= g > 0 || d > 0;
+            }
+        }
+    }
+
+    if !recovered && svg.is_empty() && spans.is_empty() {
+        return None;
+    }
+    // `DisplayPage::paper` already describes the final displayed sheet.  A
+    // rotated member is turned inside the sheet by `.turn90`/`.turn270`; do
+    // not swap the outer frame as well, or an A3 landscape sheet becomes a
+    // portrait card with large empty margins.
+    let (shown_w, shown_h) = (pw, ph);
+    body.push_str(&format!(
+        "<figure class=\"page\" id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet{}\" style=\"aspect-ratio:{:.4}\">\n{svg}{spans}</div>\n</div>\n<figcaption>{}</figcaption>\n</figure>\n",
+        shown_w / shown_h,
+        match display.rotation % 360 {
+            90 => " turn90",
+            180 => " turn180",
+            270 => " turn270",
+            _ => "",
+        },
+        pw / ph,
+        esc(&t.page_label(no)),
+    ));
+    Some((glyphs, pictures))
+}
+
+/// Use the occupied drawing box for a composed vector member whose EMF device
+/// extent is clearly much larger than the artwork it contains.
+fn member_viewbox(area: Option<(u32, u32, u32, u32)>, meta: &Metafile) -> Option<Rect> {
+    let _ = area?;
+    let bounds = meta.content_bounds()?;
+    let (dw, dh) = (
+        meta.device.0.unsigned_abs() as f32,
+        meta.device.1.unsigned_abs() as f32,
+    );
+    if dw <= 0.0 || dh <= 0.0 || bounds.width() >= dw * 0.5 || bounds.height() >= dh * 0.5 {
+        return None;
+    }
+    Some(bounds)
+}
+
+/// Convert a properties rectangle into CSS fractions of the displayed paper.
+fn display_area_place((x, y, w, h): (u32, u32, u32, u32), pw: f32, ph: f32) -> Place {
+    const PT: f32 = 72.0 / 2540.0;
+    Place {
+        x: x as f32 * PT / pw,
+        y: y as f32 * PT / ph,
+        w: w as f32 * PT / pw,
+        h: h as f32 * PT / ph,
+    }
+}
+
+/// Text-only annotation records use their rectangle as an anchor rather than
+/// as a scale box.  Artwork-bearing records must keep the normal fit-to-box
+/// behavior.
+fn is_point_sized_text(overlay: &crate::domain::page::Overlay, meta: &Metafile) -> bool {
+    overlay.area.is_some()
+        && !meta.text.is_empty()
+        && meta.images.is_empty()
+        && meta.rasters.is_empty()
+        && meta.fills.is_empty()
+        && meta.shapes.is_empty()
+}
+
+/// Fit text-only annotation contents to their properties rectangle.  A few
+/// exporters store a square metafile frame for a single-line annotation, so
+/// fitting that frame would make the text much too small.
+fn fit_text_place(mut place: Place, meta: &Metafile, pw: f32, ph: f32) -> Place {
+    let (ux, uy) = meta.units_per_point();
+    let Some((right, top, bottom)) = text_bounds(meta) else {
+        return place;
+    };
+    let text_w = right / ux;
+    let text_h = (bottom - top) / uy;
+    let area_w = place.w * pw;
+    let area_h = place.h * ph;
+    if !(text_w > 0.0 && text_h > 0.0 && area_w > 0.0 && area_h > 0.0) {
+        return place;
+    }
+    let fit = (area_w / text_w).min(area_h / text_h);
+    let (mw, mh) = meta.points();
+    if fit.is_finite() && fit > 0.0 && mw > 0.0 && mh > 0.0 {
+        place.w = mw * fit / pw;
+        place.h = mh * fit / ph;
+    }
+    place
+}
+
+/// Approximate the occupied bounds of the text runs in device units.
+fn text_bounds(meta: &Metafile) -> Option<(f32, f32, f32)> {
+    let mut right = 0.0f32;
+    let mut top = f32::INFINITY;
+    let mut bottom = f32::NEG_INFINITY;
+    for run in &meta.text {
+        for (i, ch) in run.chars.iter().enumerate() {
+            let x = run.xs.get(i).copied().unwrap_or(0.0);
+            let width = run.size * if (*ch as u32) < 0x100 { 0.55 } else { 1.0 };
+            if x.is_finite() && width.is_finite() && run.size.is_finite() && run.y.is_finite() {
+                right = right.max(x + width);
+                top = top.min(run.y - run.size);
+                bottom = bottom.max(run.y);
+            }
+        }
+    }
+    (right > 0.0 && top.is_finite() && bottom.is_finite()).then_some((right, top, bottom))
 }
 
 /// The plain-JPEG artwork that belongs to one sheet, as figures.
@@ -1068,6 +1346,7 @@ mod tests {
                 data: PageData::Bare { offset: 0, len: 0 },
                 unknown_fields: Vec::new(),
             }],
+            display_pages: Vec::new(),
             properties: None,
             properties_len: None,
             image_derived: Vec::new(),

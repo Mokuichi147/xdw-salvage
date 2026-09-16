@@ -34,6 +34,8 @@ const NULL_PEN: u32 = 8;
 
 const TA_BASELINE: u32 = 24;
 const TA_BOTTOM: u32 = 8;
+const TA_RIGHT: u32 = 2;
+const TA_CENTER: u32 = 6;
 
 /// A font as the metafile created it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -90,6 +92,8 @@ mod dw {
     /// layer, outside a begin/end path pair.
     pub const OP_LINE_DIRECT: u8 = 0x40;
     pub const OP_FILLED_POLYGON: u8 = 0x20;
+    /// Absolute 32-bit point coordinates used by EMF private Bezier paths.
+    pub const CODE_I32: u8 = 0x00;
     pub const CODE_I16: u8 = 0x20;
     pub const CODE_I8: u8 = 0x40;
     pub const CODE_NIBBLE: u8 = 0x80;
@@ -125,6 +129,30 @@ pub struct Canvas {
     picture: Option<Source>,
     /// How many stored pictures have been called for.
     pictures_called: usize,
+    /// Current GDI position used by MoveToEx/LineTo.
+    moved: Option<(i32, i32)>,
+    /// Device-context snapshots made by SaveDC.  DocuWorks uses nested saves
+    /// around annotation clips, so a later RestoreDC must also restore the
+    /// clip and mapping before the annotation outline is painted.
+    saved_states: Vec<SavedState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SavedState {
+    window_org: (i32, i32),
+    viewport_org: (i32, i32),
+    window_ext: Option<(i32, i32)>,
+    viewport_ext: Option<(i32, i32)>,
+    font: Font,
+    brush: Option<(u8, u8, u8)>,
+    pen: Option<((u8, u8, u8), f32)>,
+    align: u32,
+    text_rgb: (u8, u8, u8),
+    even_odd: bool,
+    clip: Option<Rect>,
+    clip_logical: Option<(i32, i32, i32, i32)>,
+    clip_path: Option<usize>,
+    moved: Option<(i32, i32)>,
 }
 
 impl Default for Canvas {
@@ -150,6 +178,8 @@ impl Default for Canvas {
             path: None,
             picture: None,
             pictures_called: 0,
+            moved: Some((0, 0)),
+            saved_states: Vec::new(),
         }
     }
 }
@@ -178,6 +208,59 @@ impl Canvas {
 
     pub fn skip(&mut self, kind: u32) {
         *self.page.skipped.entry(kind).or_insert(0) += 1;
+    }
+
+    /// Save the state that affects subsequent GDI drawing.
+    pub fn save_state(&mut self) {
+        self.saved_states.push(SavedState {
+            window_org: self.window_org,
+            viewport_org: self.viewport_org,
+            window_ext: self.window_ext,
+            viewport_ext: self.viewport_ext,
+            font: self.font,
+            brush: self.brush,
+            pen: self.pen,
+            align: self.align,
+            text_rgb: self.text_rgb,
+            even_odd: self.even_odd,
+            clip: self.clip,
+            clip_logical: self.clip_logical,
+            clip_path: self.clip_path,
+            moved: self.moved,
+        });
+    }
+
+    /// Restore a saved state.  Negative levels are relative to the newest
+    /// snapshot (`-1` is the common EMF form); positive levels are the
+    /// one-based SaveDC return values used by the Win32 API.
+    pub fn restore_state(&mut self, level: i32) {
+        let Some(index) = (if level < 0 {
+            self.saved_states.len() as i32 + level
+        } else {
+            level - 1
+        })
+        .try_into()
+        .ok()
+        .filter(|&index: &usize| index < self.saved_states.len()) else {
+            return;
+        };
+        let state = self.saved_states[index];
+        self.window_org = state.window_org;
+        self.viewport_org = state.viewport_org;
+        self.window_ext = state.window_ext;
+        self.viewport_ext = state.viewport_ext;
+        self.font = state.font;
+        self.brush = state.brush;
+        self.pen = state.pen;
+        self.align = state.align;
+        self.text_rgb = state.text_rgb;
+        self.even_odd = state.even_odd;
+        self.clip = state.clip;
+        self.clip_logical = state.clip_logical;
+        self.clip_path = state.clip_path;
+        self.moved = state.moved;
+        // RestoreDC discards the restored level and every newer level.
+        self.saved_states.truncate(index);
     }
 
     pub fn finish(self) -> Metafile {
@@ -227,6 +310,19 @@ impl Canvas {
     /// A logical distance in device units.
     pub fn device_len(&self, v: f32) -> f32 {
         v * self.scale().1.abs()
+    }
+
+    /// Set the current GDI position.
+    pub fn move_to(&mut self, x: i32, y: i32) {
+        self.moved = Some((x, y));
+    }
+
+    /// Draw a line from the current GDI position and advance it.
+    pub fn line_to(&mut self, x: i32, y: i32) {
+        if let Some((from_x, from_y)) = self.moved {
+            self.polygon(&[(from_x, from_y), (x, y)], false);
+        }
+        self.moved = Some((x, y));
     }
 
     // ----- objects -----
@@ -315,8 +411,16 @@ impl Canvas {
         let order = self.advance();
         let (dx, dy) = self.device(x, y);
         let (sx, sy) = self.scale();
+        let total_advance: f32 = (0..chars.len())
+            .map(|i| advances.get(i).copied().unwrap_or(0.0) * sx)
+            .sum();
+        let start_x = match self.align & TA_CENTER {
+            TA_RIGHT => dx - total_advance,
+            TA_CENTER => dx - total_advance * 0.5,
+            _ => dx,
+        };
         let mut xs = Vec::with_capacity(chars.len());
-        let mut cursor = dx;
+        let mut cursor = start_x;
         for i in 0..chars.len() {
             xs.push(cursor);
             cursor += advances.get(i).copied().unwrap_or(0.0) * sx;
@@ -473,6 +577,37 @@ impl Canvas {
             even_odd: self.even_odd,
         };
         self.paint(path, closed, true, order);
+    }
+
+    /// Paint several polygons from one GDI record as one path.  Multi-polygon
+    /// records are used for outlined glyphs; keeping their contours together
+    /// preserves the selected even-odd fill rule and the holes in each glyph.
+    pub fn polygons(&mut self, polygons: &[Vec<(i32, i32)>], closed: bool) {
+        let order = self.advance();
+        let figures: Vec<Figure> = polygons
+            .iter()
+            .filter(|points| points.len() >= 2)
+            .map(|points| {
+                let pts: Vec<(f32, f32)> = points.iter().map(|&(x, y)| self.device(x, y)).collect();
+                Figure {
+                    start: pts[0],
+                    segments: pts[1..].iter().map(|p| Segment::Line(*p)).collect(),
+                    closed,
+                }
+            })
+            .collect();
+        if figures.is_empty() {
+            return;
+        }
+        self.paint(
+            Path {
+                figures,
+                even_odd: self.even_odd,
+            },
+            closed,
+            true,
+            order,
+        );
     }
 
     /// Paint an axis-aligned ellipse using four cubic Bézier segments.
@@ -698,7 +833,10 @@ impl Canvas {
     /// current figure; `LINE` starts a new one.
     fn geometry(&mut self, body: &[u8]) -> bool {
         let (op, code) = (body[2], body[3]);
-        if !matches!(code, dw::CODE_I16 | dw::CODE_I8 | dw::CODE_NIBBLE) {
+        if !matches!(
+            code,
+            dw::CODE_I32 | dw::CODE_I16 | dw::CODE_I8 | dw::CODE_NIBBLE
+        ) {
             return false;
         }
         let Some(points) = decode_points(body) else {
@@ -866,16 +1004,31 @@ fn crop(raster: &mut Raster, (sx, sy, sw, sh): (i32, i32, i32, i32)) {
 
 /// Decode a geometry comment's point list.
 ///
-/// The count is followed by the first point as two 16-bit values. What
-/// follows depends on the coding byte: further absolute 16-bit points, 8-bit
-/// deltas, or one byte per point holding two signed 4-bit deltas where the
-/// value -8 means the delta is in the next byte instead (and -128 there means
-/// the next two bytes).
+/// The count is followed by absolute 32-bit points for the private EMF Bezier
+/// coding, or by the first point as two 16-bit values for the compact codings.
+/// The latter continue with absolute 16-bit points, 8-bit deltas, or one byte
+/// per point holding two signed 4-bit deltas where the value -8 means the
+/// delta is in the next byte instead (and -128 there means the next two
+/// bytes).
 pub fn decode_points(body: &[u8]) -> Option<Vec<(i32, i32)>> {
     let code = *body.get(3)?;
     let n = u32_at(body, 4)? as usize;
     if n == 0 || n > 1 << 20 {
         return None;
+    }
+    if code == dw::CODE_I32 {
+        let mut x = i32_at(body, 8)?;
+        let mut y = i32_at(body, 12)?;
+        let mut pts = Vec::with_capacity(n);
+        pts.push((x, y));
+        let mut at = 16usize;
+        for _ in 1..n {
+            x = i32_at(body, at)?;
+            y = i32_at(body, at + 4)?;
+            at += 8;
+            pts.push((x, y));
+        }
+        return Some(pts);
     }
     let mut x = i32::from(i16_at(body, 8)?);
     let mut y = i32::from(i16_at(body, 10)?);
@@ -997,6 +1150,20 @@ mod tests {
     }
 
     #[test]
+    fn thirty_two_bit_points_are_absolute() {
+        let mut b = b"DW\x13\0".to_vec();
+        b.extend_from_slice(&4u32.to_le_bytes());
+        for (x, y) in [(10i32, 20i32), (30, 40), (50, 60), (70, 80)] {
+            b.extend_from_slice(&x.to_le_bytes());
+            b.extend_from_slice(&y.to_le_bytes());
+        }
+        assert_eq!(
+            decode_points(&b),
+            Some(vec![(10, 20), (30, 40), (50, 60), (70, 80)])
+        );
+    }
+
+    #[test]
     fn eight_bit_points_are_deltas() {
         let b = geometry(0x20, 0x40, 3, (10, 20), &[2, 0xFF, 0x80, 1]);
         assert_eq!(
@@ -1038,6 +1205,29 @@ mod tests {
     }
 
     #[test]
+    fn centered_text_uses_the_reference_point_as_its_center() {
+        let mut c = Canvas::new((100, 100), (1000, 1000));
+        c.set_text_align(TA_CENTER);
+        c.text(100, 200, vec!['a', 'b'], &[20.0, 20.0]);
+        assert_eq!(c.page.text[0].xs, vec![80.0, 100.0]);
+    }
+
+    #[test]
+    fn multi_polygon_keeps_contours_in_one_shape() {
+        let mut c = Canvas::new((100, 100), (1000, 1000));
+        c.polygons(
+            &[
+                vec![(10, 10), (40, 10), (40, 40)],
+                vec![(60, 60), (90, 60), (90, 90)],
+            ],
+            true,
+        );
+        assert_eq!(c.page.shapes.len(), 1);
+        assert_eq!(c.page.shapes[0].path.figures.len(), 2);
+        assert!(c.page.shapes[0].path.figures.iter().all(|f| f.closed));
+    }
+
+    #[test]
     fn a_clip_rectangle_covering_the_page_is_no_clip_at_all() {
         let mut c = Canvas::new((4961, 7016), (21000, 29700));
         c.set_window_org(-109, -109);
@@ -1053,6 +1243,40 @@ mod tests {
                 bottom: 409.0
             })
         );
+    }
+
+    #[test]
+    fn restore_state_reinstates_the_clip_and_mapping() {
+        let mut c = Canvas::new((1000, 1000), (1000, 1000));
+        c.set_window_org(10, 20);
+        c.save_state();
+        c.set_window_org(100, 200);
+        c.set_clip_rect(120, 220, 180, 280);
+        assert!(c.clip.is_some());
+
+        c.restore_state(-1);
+
+        assert_eq!(c.window_org, (10, 20));
+        assert_eq!(c.clip, None);
+    }
+
+    #[test]
+    fn restoring_a_positive_level_discards_newer_snapshots() {
+        let mut c = Canvas::new((100, 100), (100, 100));
+        c.set_window_org(1, 2);
+        c.save_state();
+        c.set_window_org(3, 4);
+        c.save_state();
+        c.set_window_org(5, 6);
+
+        c.restore_state(1);
+
+        assert_eq!(c.window_org, (1, 2));
+        c.set_window_org(7, 8);
+        c.save_state();
+        c.set_window_org(9, 10);
+        c.restore_state(-1);
+        assert_eq!(c.window_org, (7, 8));
     }
 
     #[test]

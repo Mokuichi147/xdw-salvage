@@ -31,11 +31,10 @@ pub enum Error {
     },
     /// The container format generation is outside what this crate has been
     /// verified against.
-    ///
-    /// This is also what you get for password-protected or digitally signed
-    /// documents: those are written as a later generation. This crate does not
-    /// attempt to read them, and deliberately implements no way to do so.
     UnsupportedGeneration(u32),
+    /// The container advertises DocuWorks security metadata. Its page data is
+    /// intentionally inaccessible without authorized authentication.
+    ProtectedDocument,
     /// A coded stream ended before it had produced the length the container
     /// declared for it.
     CodingTruncated {
@@ -83,10 +82,12 @@ impl fmt::Display for Error {
             Error::MissingField { tag, in_tag } => {
                 write!(f, "field 0x{tag:02x} missing from element 0x{in_tag:02x}")
             }
-            Error::UnsupportedGeneration(v) => write!(
-                f,
-                "container generation {v} is not supported (protected or signed \
-                 documents use a later generation; this crate does not read them)"
+            Error::UnsupportedGeneration(v) => {
+                write!(f, "container generation {v} is not supported")
+            }
+            Error::ProtectedDocument => f.write_str(
+                "document is password-, certificate-, or signature-protected; \
+                 content cannot be read without authorized authentication",
             ),
             Error::Io(e) => write!(f, "io error: {e}"),
         }

@@ -16,7 +16,9 @@ use crate::domain::Document;
 /// What a converted document ought to look like.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expectation {
-    /// Pages a faithful conversion should produce: the document's sheets.
+    /// Pages a faithful conversion should produce: logical displayed pages
+    /// when the properties block provides them, otherwise the document's
+    /// physical sheets.
     ///
     /// Thumbnails are not pages, and neither are the pictures a sheet is made
     /// of - a pamphlet cover holding three strips of artwork is one page, not
@@ -36,6 +38,21 @@ impl Expectation {
     /// Read the expectation out of a parsed container.
     pub fn of(doc: &Document) -> Expectation {
         let cov = doc.coverage();
+        if !doc.display_pages.is_empty() {
+            return Expectation {
+                pages: doc.display_pages.len(),
+                previews: cov.thumbnails,
+                pictures: cov.pictures,
+                sizes: doc
+                    .display_pages
+                    .iter()
+                    .map(|page| {
+                        page.paper
+                            .map(|(w, h)| (w as f32 * 72.0 / 2540.0, h as f32 * 72.0 / 2540.0))
+                    })
+                    .collect(),
+            };
+        }
         let pages: Vec<_> = doc.sheets().collect();
         Expectation {
             pages: pages.len(),

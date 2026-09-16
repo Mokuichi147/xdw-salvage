@@ -54,6 +54,7 @@ fn empty_document() -> Document {
         trailer_at: 0,
         declared_entries: 0,
         pages: Vec::new(),
+        display_pages: Vec::new(),
         properties: None,
         properties_len: None,
         image_derived: Vec::new(),

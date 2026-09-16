@@ -30,8 +30,8 @@
 //! of its picture is drawn whole.
 //!
 //! Password-protected and digitally signed documents are refused. They are
-//! written as a later container generation, and no facility to read past access
-//! control is implemented here or planned.
+//! written as a later container generation, and this crate does not bypass
+//! their access control; an authorized reader must provide the contents.
 //!
 //! # Example
 //!

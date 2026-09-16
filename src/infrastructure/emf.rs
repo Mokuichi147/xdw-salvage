@@ -1,11 +1,12 @@
 //! 復号後のWindows拡張メタファイルをドメインモデルへ変換するパーサー。
 
 use crate::domain::rendering::{FontKind, Metafile};
-use crate::infrastructure::gdi::{i32_at, rgb, u32_at, Canvas, Font, Object};
+use crate::infrastructure::gdi::{i16_at, i32_at, rgb, u32_at, Canvas, Font, Object};
 
 const REC_HEAD: usize = 8;
 
 const EMR_HEADER: u32 = 1;
+const EMR_POLYPOLYGON: u32 = 8;
 const EMR_MOVETOEX: u32 = 27;
 const EMR_LINETO: u32 = 54;
 const EMR_POLYGON: u32 = 3;
@@ -33,7 +34,10 @@ const EMR_EXTTEXTOUTA: u32 = 83;
 const EMR_EXTTEXTOUTW: u32 = 84;
 const EMR_POLYGON16: u32 = 86;
 const EMR_POLYLINE16: u32 = 87;
+const EMR_POLYPOLYGON16: u32 = 91;
 const EMR_EXTCREATEPEN: u32 = 95;
+const EMR_SAVEDC: u32 = 33;
+const EMR_RESTOREDC: u32 = 34;
 
 const PATCOPY: u32 = 0x00F0_0021;
 const BS_NULL: u32 = 1;
@@ -55,7 +59,6 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
 
     let mut at = 0usize;
     let mut guard = d.len() / REC_HEAD + 2;
-    let mut moved: Option<(i32, i32)> = Some((0, 0));
     while at + REC_HEAD <= d.len() && guard > 0 {
         guard -= 1;
         let kind = u32_at(d, at)?;
@@ -66,6 +69,12 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
         let r = &d[at..at + size];
         match kind {
             EMR_HEADER | EMR_EOF => {}
+            EMR_SAVEDC => c.save_state(),
+            EMR_RESTOREDC => {
+                if let Some(level) = i32_at(r, 8) {
+                    c.restore_state(level);
+                }
+            }
             EMR_SETWINDOWORGEX => {
                 if let (Some(x), Some(y)) = (i32_at(r, 8), i32_at(r, 12)) {
                     c.set_window_org(x, y);
@@ -98,15 +107,12 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
             }
             EMR_MOVETOEX => {
                 if let (Some(x), Some(y)) = (i32_at(r, 8), i32_at(r, 12)) {
-                    moved = Some((x, y));
+                    c.move_to(x, y);
                 }
             }
             EMR_LINETO => {
-                if let (Some((from_x, from_y)), Some(x), Some(y)) =
-                    (moved, i32_at(r, 8), i32_at(r, 12))
-                {
-                    c.polygon(&[(from_x, from_y), (x, y)], false);
-                    moved = Some((x, y));
+                if let (Some(x), Some(y)) = (i32_at(r, 8), i32_at(r, 12)) {
+                    c.line_to(x, y);
                 }
             }
             EMR_EXTCREATEFONTINDIRECTW => {
@@ -193,9 +199,19 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
                     c.polygon(&pts, kind == EMR_POLYGON);
                 }
             }
+            EMR_POLYPOLYGON => {
+                if let Some(polygons) = polygons32(r) {
+                    c.polygons(&polygons, true);
+                }
+            }
             EMR_POLYGON16 | EMR_POLYLINE16 => {
                 if let Some(pts) = points16(r) {
                     c.polygon(&pts, kind == EMR_POLYGON16);
+                }
+            }
+            EMR_POLYPOLYGON16 => {
+                if let Some(polygons) = polygons16(r) {
+                    c.polygons(&polygons, true);
                 }
             }
             EMR_EXTTEXTOUTA | EMR_EXTTEXTOUTW => {
@@ -205,7 +221,23 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
             }
             EMR_GDICOMMENT => {
                 let len = u32_at(r, 8).unwrap_or(0) as usize;
-                let body = r.get(12..12 + len.min(r.len().saturating_sub(12)));
+                let available = r.get(12..);
+                // The printer driver's path commands are unusual: the
+                // `cbData` field describes only the four-byte `DW13`/`DW20`
+                // command, while the point list follows in the same EMF
+                // record. Ordinary comments keep the declared-length rule so
+                // the EMF record's alignment padding does not become part of
+                // a compact point stream.
+                let body = available.and_then(|body| {
+                    let appended_geometry = len == 4
+                        && body.starts_with(b"DW")
+                        && matches!(body.get(2), Some(0x13 | 0x20));
+                    if appended_geometry {
+                        Some(body)
+                    } else {
+                        body.get(..len.min(body.len()))
+                    }
+                });
                 if !body.is_some_and(|b| c.comment(b)) {
                     c.skip(kind);
                 }
@@ -227,7 +259,9 @@ fn emf_font_kind(r: &[u8]) -> FontKind {
     let face = r
         .get(40..104)
         .unwrap_or_default()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| u16::from_le_bytes([p[0], p[1]]))
         .take_while(|&u| u != 0)
         .collect::<Vec<_>>();
@@ -273,6 +307,87 @@ fn points16(r: &[u8]) -> Option<Vec<(i32, i32)>> {
                 i32::from(crate::infrastructure::gdi::i16_at(r, 28 + i * 4)?),
                 i32::from(crate::infrastructure::gdi::i16_at(r, 30 + i * 4)?),
             ))
+        })
+        .collect()
+}
+
+/// Points of a 32-bit multi-polygon record.  The record stores all polygon
+/// counts first, followed by one contiguous POINTL array.
+fn polygons32(r: &[u8]) -> Option<Vec<Vec<(i32, i32)>>> {
+    let polygons = usize::try_from(u32_at(r, 24)?).ok()?;
+    let points = usize::try_from(u32_at(r, 28)?).ok()?;
+    if polygons == 0 || polygons > 1 << 20 || points < polygons || points > 1 << 20 {
+        return None;
+    }
+    let counts_end = 32usize.checked_add(polygons.checked_mul(4)?)?;
+    if counts_end > r.len() {
+        return None;
+    }
+    let counts: Vec<usize> = (0..polygons)
+        .map(|i| usize::try_from(u32_at(r, 32 + i * 4)?).ok())
+        .collect::<Option<_>>()?;
+    if counts.iter().sum::<usize>() != points {
+        return None;
+    }
+    let points_end = counts_end.checked_add(points.checked_mul(8)?)?;
+    if points_end > r.len() {
+        return None;
+    }
+    let mut at = counts_end;
+    counts
+        .into_iter()
+        .map(|count| {
+            let end = at.checked_add(count.checked_mul(8)?)?;
+            let polygon = (0..count)
+                .map(|_| {
+                    let point = (i32_at(r, at)?, i32_at(r, at + 4)?);
+                    at += 8;
+                    Some(point)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (end == at).then_some(polygon)
+        })
+        .collect()
+}
+
+/// Points of a 16-bit multi-polygon record.  Its layout mirrors the 32-bit
+/// record but uses POINTS (two signed 16-bit coordinates).
+fn polygons16(r: &[u8]) -> Option<Vec<Vec<(i32, i32)>>> {
+    let polygons = usize::try_from(u32_at(r, 24)?).ok()?;
+    let points = usize::try_from(u32_at(r, 28)?).ok()?;
+    if polygons == 0 || polygons > 1 << 20 || points < polygons || points > 1 << 20 {
+        return None;
+    }
+    let counts_end = 32usize.checked_add(polygons.checked_mul(4)?)?;
+    if counts_end > r.len() {
+        return None;
+    }
+    let counts: Vec<usize> = (0..polygons)
+        .map(|i| usize::try_from(u32_at(r, 32 + i * 4)?).ok())
+        .collect::<Option<_>>()?;
+    if counts.iter().sum::<usize>() != points {
+        return None;
+    }
+    let points_end = counts_end.checked_add(points.checked_mul(4)?)?;
+    if points_end > r.len() {
+        return None;
+    }
+    let mut at = counts_end;
+    counts
+        .into_iter()
+        .map(|count| {
+            let end = at.checked_add(count.checked_mul(4)?)?;
+            let polygon = (0..count)
+                .map(|_| {
+                    let point = (
+                        i16_at(r, at).map(i32::from)?,
+                        i16_at(r, at + 2).map(i32::from)?,
+                    );
+                    at += 4;
+                    Some(point)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (end == at).then_some(polygon)
         })
         .collect()
 }
@@ -353,4 +468,49 @@ fn text_out(r: &[u8], wide: bool, c: &mut Canvas) -> bool {
     }
     c.text(x, y, chars, &advances);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sixteen_bit_multi_polygon_reads_counts_before_points() {
+        let mut r = vec![0u8; 32 + 2 * 4 + 7 * 4];
+        r[24..28].copy_from_slice(&2u32.to_le_bytes());
+        r[28..32].copy_from_slice(&7u32.to_le_bytes());
+        r[32..36].copy_from_slice(&3u32.to_le_bytes());
+        r[36..40].copy_from_slice(&4u32.to_le_bytes());
+        let points = [
+            (10i16, 20i16),
+            (30, 40),
+            (50, 60),
+            (70, 80),
+            (90, 100),
+            (110, 120),
+            (130, 140),
+        ];
+        for (i, &(x, y)) in points.iter().enumerate() {
+            let at = 40 + i * 4;
+            r[at..at + 2].copy_from_slice(&x.to_le_bytes());
+            r[at + 2..at + 4].copy_from_slice(&y.to_le_bytes());
+        }
+        assert_eq!(
+            polygons16(&r),
+            Some(vec![
+                vec![(10, 20), (30, 40), (50, 60)],
+                vec![(70, 80), (90, 100), (110, 120), (130, 140)],
+            ])
+        );
+    }
+
+    #[test]
+    fn malformed_multi_polygon_counts_are_rejected() {
+        let mut r = vec![0u8; 40];
+        r[24..28].copy_from_slice(&2u32.to_le_bytes());
+        r[28..32].copy_from_slice(&3u32.to_le_bytes());
+        r[32..36].copy_from_slice(&1u32.to_le_bytes());
+        r[36..40].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(polygons16(&r), None);
+    }
 }
