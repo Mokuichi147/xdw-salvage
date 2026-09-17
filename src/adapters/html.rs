@@ -1,9 +1,9 @@
 //! A single self-contained HTML page per document.
 //!
-//! Everything travels inside the one file: recovered page images as data URLs,
-//! any original file found in the container offered for download, and a card in
-//! place of every page whose image is in the vendor's coding, so the reading
-//! order still matches the original document.
+//! Everything travels inside the one file: recovered page images as data URLs
+//! and any original file found in the container offered for download.  The
+//! generated page keeps the document content visually plain; the source name
+//! is assigned to the HTML title and used as the base for optional downloads.
 
 use crate::application::ports::{AttachmentScanner, PageDecoder};
 use crate::application::recovery;
@@ -23,11 +23,10 @@ pub struct Options {
     pub decode: bool,
     /// Language of the text this crate writes into the page.
     pub lang: Lang,
-    /// Shown as the document heading and in the browser tab.
+    /// Used as the document title and browser tab name.
     pub title: Option<String>,
     /// Include preview entries. Off by default; they are low resolution copies
-    /// of other pages and they are in the vendor coding, so they arrive as
-    /// cards rather than pictures.
+    /// of other pages and they are in the vendor coding.
     pub include_previews: bool,
     /// Carry original files found in the container as download links.
     pub embed_originals: bool,
@@ -36,10 +35,9 @@ pub struct Options {
     pub skip_missing: bool,
     /// Offer the whole source document for download from the page.
     ///
-    /// For an archive where most pages are in the vendor coding, a page of
-    /// empty cards is not a migration on its own. With the source carried
-    /// inside it, the file is at least a strict superset of the one it came
-    /// from. It roughly doubles the output, so it is off by default.
+    /// For an archive where most pages are in the vendor coding, carrying the
+    /// source preserves the original bytes alongside the recovered content.
+    /// It roughly doubles the output, so it is off by default.
     pub carry_source: bool,
 }
 
@@ -90,8 +88,9 @@ where
     A: AttachmentScanner + ?Sized,
 {
     let mut report = Report::default();
-    // One card per sheet. Thumbnails and the pictures a sheet is made of are
-    // not sheets; listing them as pages would misreport the document's length.
+    // One output item per sheet. Thumbnails and the pictures a sheet is made of
+    // are not sheets; listing them as pages would misreport the document's
+    // length.
     let display_mode = !doc.display_pages.is_empty();
     let selected: Vec<&Page> = if display_mode {
         doc.display_pages
@@ -139,7 +138,6 @@ where
     let t = Text::for_lang(opts.lang);
 
     let mut body = String::new();
-    let mut gaps: Vec<usize> = Vec::new();
     let mut no = 0usize;
     if display_mode {
         for display in &doc.display_pages {
@@ -154,11 +152,9 @@ where
                 report.skipped += 1;
             } else {
                 report.gaps += 1;
-                gaps.push(no);
                 body.push_str(&format!(
-                    "<section class=\"page gap\" id=\"p{no}\"><p class=\"no\">{}</p><p class=\"why\">{}</p><p class=\"meta\">display page</p></section>\n",
-                    esc(&t.page_label(no)),
-                    esc(t.gap_why),
+                    "<section id=\"p{no}\" class=\"gap\"><p class=\"why\">{}</p></section>\n",
+                    esc(t.gap_why)
                 ));
             }
         }
@@ -196,7 +192,6 @@ where
             match p.data {
                 PageData::Jpeg { offset, len } if offset + len <= data.len() => {
                     report.embedded += 1;
-                    let (w, h) = p.pixels.unwrap_or((0, 0));
                     if let Some(label) = merged_labels.get(i + 1).and_then(Option::as_ref) {
                         let paper = p.paper.unwrap_or((21000, 29700));
                         let pw = paper.0 as f32 * 72.0 / 2540.0;
@@ -218,19 +213,17 @@ where
                         report.glyphs += g;
                         report.pictures += d;
                         body.push_str(&format!(
-                        "<figure class=\"page\" id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet\" style=\"aspect-ratio:{:.4}\">\n<img class=\"art\" style=\"left:0%;top:0%;width:100%;height:100%\" loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n{svg}{spans}</div>\n</div>\n<figcaption>{} &middot; {w}&times;{h}px</figcaption>\n</figure>\n",
+                        "<figure id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet\" style=\"aspect-ratio:{:.4}\">\n<img class=\"art\" style=\"left:0%;top:0%;width:100%;height:100%\" loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n{svg}{spans}</div>\n</div>\n</figure>\n",
                         pw / ph,
                         pw / ph,
-                        esc(&t.page_alt(no)),
+                        esc(t.page_alt),
                         b64(&data[offset..offset + len]),
-                        esc(&t.page_label(no)),
                     ));
                     } else {
                         body.push_str(&format!(
-                        "<figure class=\"page\" id=\"p{no}\">\n<img loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n<figcaption>{} &middot; {w}&times;{h}px</figcaption>\n</figure>\n",
-                        esc(&t.page_alt(no)),
+                        "<figure id=\"p{no}\">\n<img loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n</figure>\n",
+                        esc(t.page_alt),
                         b64(&data[offset..offset + len]),
-                        esc(&t.page_label(no)),
                     ));
                     }
                 }
@@ -255,30 +248,17 @@ where
                         continue;
                     }
                     report.gaps += 1;
-                    gaps.push(no);
-                    let size = p
-                        .paper
-                        .map(|(w, h)| {
-                            format!("{:.0}&times;{:.0} mm", w as f32 / 100.0, h as f32 / 100.0)
-                        })
-                        .unwrap_or_else(|| "&mdash;".into());
                     // The sheet itself could not be expanded, but the pictures on
                     // it are plain JPEG. Show them: a page comes back as its
                     // artwork instead of an empty box.
-                    let (mut art, count) = artwork(data, doc, p.index, no, &t);
-                    let images = usize::from(!art.is_empty());
+                    let (mut art, count) = artwork(data, doc, p.index, &t);
                     report.pictures += count;
-                    if images > 0 {
-                        art = format!(
-                            "<p class=\"why art-note\">{}</p>\n<div class=\"arts\">\n{art}</div>\n",
-                            esc(&t.art_note(images))
-                        );
+                    if !art.is_empty() {
+                        art = format!("<div class=\"arts\">\n{art}</div>\n");
                     }
                     body.push_str(&format!(
-                    "<section class=\"page gap\" id=\"p{no}\">\n<p class=\"no\">{}</p>\n<p class=\"why\">{}</p>\n<p class=\"meta\">{size} &middot; {}</p>\n{art}</section>\n",
-                    esc(&t.page_label(no)),
+                    "<section id=\"p{no}\" class=\"gap\">\n<p class=\"why\">{}</p>\n{art}</section>\n",
                     esc(t.gap_why),
-                    esc(p.kind_name()),
                 ));
                 }
             }
@@ -288,10 +268,7 @@ where
     // holds was dropped. A page that just stops without saying so is worse than
     // either, so say so.
     if body.is_empty() {
-        body.push_str(&format!(
-            "<section class=\"page gap\"><p class=\"why\">{}</p></section>\n",
-            esc(t.empty)
-        ));
+        body.push_str(&format!("<p class=\"why\">{}</p>\n", esc(t.empty)));
     }
 
     let mut files = String::new();
@@ -303,12 +280,10 @@ where
             report.attachments += 1;
             let name = format!("{}-original-{}.{}", stem(&title), n + 1, a.kind.extension());
             files.push_str(&format!(
-                "<li><a download=\"{}\" href=\"data:application/octet-stream;base64,{}\">{}</a> <span class=\"meta\">{} &middot; {} B</span></li>\n",
+                "<li><a download=\"{}\" href=\"data:application/octet-stream;base64,{}\">{}</a></li>\n",
                 esc(&name),
                 b64(&data[a.offset..a.offset + a.len]),
                 esc(&name),
-                esc(a.kind.label()),
-                a.len,
             ));
         }
     }
@@ -317,105 +292,61 @@ where
         report.attachments += 1;
         let name = format!("{}.xdw", stem(&title));
         files.push_str(&format!(
-            "<li><a download=\"{}\" href=\"data:application/octet-stream;base64,{}\">{}</a> <span class=\"meta\">{} &middot; {} B</span></li>\n",
+            "<li><a download=\"{}\" href=\"data:application/octet-stream;base64,{}\">{}</a></li>\n",
             esc(&name),
             b64(data),
             esc(&name),
-            esc(t.source),
-            data.len(),
         ));
     }
 
-    let mut head_note = format!(
-        "{} &middot; {}",
-        t.count(
-            report.embedded,
-            selected
-                .len()
-                .saturating_sub(merge_label.iter().filter(|v| **v).count()),
-        ),
-        esc(&title)
-    );
-    if report.gaps > 0 {
-        head_note.push_str(&format!(" &middot; {}", t.gap_count(report.gaps)));
-    }
-
-    let mut index = String::new();
-    if !gaps.is_empty() {
-        index.push_str(&format!("<p class=\"gaps\"><b>{}</b> ", esc(t.gap_list)));
-        for (k, n) in gaps.iter().enumerate() {
-            if k == 40 {
-                index.push_str(&format!("&hellip; (+{})", gaps.len() - 40));
-                break;
-            }
-            index.push_str(&format!("<a href=\"#p{n}\">{n}</a> "));
-        }
-        index.push_str("</p>\n");
-    }
+    // Attachments are functional content rather than document chrome, so keep
+    // them after the recovered pages without adding a heading or file-size
+    // summary.
     if !files.is_empty() {
-        index.push_str(&format!(
-            "<p class=\"gaps\"><b>{}</b></p>\n<ul class=\"files\">\n{files}</ul>\n",
-            esc(t.originals)
-        ));
+        body.push_str("<ul class=\"files\">\n");
+        body.push_str(&files);
+        body.push_str("</ul>\n");
     }
 
     let html = format!(
-        "<!doctype html>\n<html lang=\"{lang}\">\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{title_esc}</title>\n<style>{CSS}</style>\n<header>\n<h1>{title_esc}</h1>\n<p class=\"meta\">{head_note}</p>\n{index}</header>\n<main>\n{body}</main>\n<footer><p class=\"meta\">{footer}</p></footer>\n</html>\n",
+        "<!doctype html>\n<html lang=\"{lang}\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{title_esc}</title>\n<style>{CSS}</style>\n</head>\n<body>\n<main>\n{body}</main>\n</body>\n</html>\n",
         lang = t.lang_attr,
         title_esc = esc(&title),
-        footer = esc(t.footer),
     );
     (html, report)
 }
 
 const CSS: &str = "\
-:root{color-scheme:light dark;--bg:#f7f7f5;--fg:#1b1b1a;--dim:#6b6b68;--line:#d8d8d4;--card:#fff}\
-@media(prefers-color-scheme:dark){:root{--bg:#16161a;--fg:#e9e9e6;--dim:#9a9a96;--line:#33333a;--card:#1e1e23}}\
+:root{color-scheme:light dark;--bg:#fff;--fg:#1b1b1a;--dim:#6b6b68}\
+@media(prefers-color-scheme:dark){:root{--bg:#16161a;--fg:#e9e9e6;--dim:#9a9a96}}\
 *{box-sizing:border-box}\
 body{margin:0;padding:0 16px 48px;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,'Segoe UI',sans-serif}\
-header,main,footer{max-width:960px;margin:0 auto}\
-header{padding:28px 0 16px;border-bottom:1px solid var(--line)}\
-h1{margin:0 0 6px;font-size:1.35rem;word-break:break-all}\
-.meta{color:var(--dim);font-size:.85rem;margin:4px 0}\
+main{max-width:960px;margin:0 auto}\
+figure{margin:0 0 28px}\
 .frame{position:relative;width:100%;overflow:hidden;container-type:size}\
 .sheet{position:absolute;left:0;top:0;width:100%;background:#fff;color:#000;overflow:hidden;container-type:size}\
 .sheet.turn90{width:100cqh;height:100cqw;transform-origin:0 0;transform:translateX(100cqw) rotate(90deg)}\
 .sheet.turn180{transform:rotate(180deg)}\
 .sheet.turn270{width:100cqh;height:100cqw;transform-origin:0 0;transform:translateY(100cqh) rotate(-90deg)}\
-.sheet .art{position:absolute;display:block}\
+.sheet .art{position:absolute;display:block;object-fit:contain;object-position:center;background:#fff}\
 .sheet span{position:absolute;white-space:pre;line-height:1;font-family:\"Hiragino Kaku Gothic ProN\",\"Yu Gothic\",\"Meiryo\",\"Noto Sans JP\",sans-serif}\
-.gaps{margin:10px 0 0;font-size:.85rem}\
-.gaps a{display:inline-block;padding:0 4px;color:inherit}\
-.files{margin:6px 0 0;padding-left:18px;font-size:.85rem}\
-main{padding-top:24px}\
-.page{margin:0 0 28px;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px}\
-.page img{display:block;width:100%;height:auto;border-radius:3px}\
-figcaption{color:var(--dim);font-size:.8rem;padding-top:8px}\
-.gap{border-style:dashed;text-align:center;padding:28px 12px}\
-.arts{display:flex;flex-direction:column;gap:6px;margin-top:14px}\
+.files{margin:28px 0 0;padding-left:18px;font-size:.85rem}\
+figure>img{display:block;width:100%;height:auto}\
+.gap .why{margin:0 0 28px;color:var(--dim);font-size:.9rem}\
+.arts{display:flex;flex-direction:column;gap:6px}\
 .art{margin:0;position:relative}\
-.bands{display:flex;flex-direction:column;line-height:0;border-radius:3px;overflow:hidden}\
+.bands{display:flex;flex-direction:column;line-height:0;overflow:hidden}\
 .art img{display:block;width:100%;height:auto}\
-.art figcaption{color:var(--dim);font-size:.68rem;text-align:right;padding-top:2px;opacity:.65}\
-.art-note{margin-top:12px!important;font-size:.8rem}\
-.gap .no{margin:0 0 8px;font-weight:600}\
-.gap .why{margin:0;color:var(--dim);font-size:.9rem}\
-footer{padding-top:20px;border-top:1px solid var(--line)}\
-@media print{body{background:#fff}.page{break-inside:avoid;border:none;padding:0}}\
+@media print{body{background:#fff}figure{break-inside:avoid}}\
 ";
 
 /// Every string this crate writes into the page, in one place.
 struct Text {
     lang_attr: &'static str,
     gap_why: &'static str,
-    art_one: &'static str,
-    bands_one: &'static str,
-    gap_list: &'static str,
-    originals: &'static str,
-    source: &'static str,
+    page_alt: &'static str,
+    art_alt: &'static str,
     empty: &'static str,
-    footer: &'static str,
-    ja: bool,
 }
 
 impl Text {
@@ -424,84 +355,18 @@ impl Text {
             Lang::Japanese => Text {
                 lang_attr: "ja",
                 gap_why: "ページ画像がコンテナ独自の符号化で格納されており、復元できません。",
-                art_one: "このページから取り出せた画像",
-                bands_one: "帯を連結",
-                gap_list: "復元できなかったページ:",
-                originals: "このページに入っているファイル",
-                source: "変換元",
+                page_alt: "復元したページ",
+                art_alt: "ページから取り出した画像",
                 empty: "この文書から復元できるページはありません。",
-                footer: "xdw-salvage が生成。FUJIFILM Business Innovation とは無関係の非公式ツールです。",
-                ja: true,
             },
             Lang::English => Text {
                 lang_attr: "en",
-                gap_why: "The page image is stored in the container's own coding and was not recovered.",
-                art_one: "Artwork recovered from this page",
-                bands_one: "bands joined",
-                gap_list: "Pages not recovered:",
-                originals: "Files carried in this page",
-                source: "source document",
+                gap_why:
+                    "The page image is stored in the container's own coding and was not recovered.",
+                page_alt: "Recovered document page",
+                art_alt: "Artwork recovered from this page",
                 empty: "No page of this document could be recovered.",
-                footer: "Produced by xdw-salvage, an unofficial tool, not affiliated with FUJIFILM Business Innovation.",
-                ja: false,
             },
-        }
-    }
-
-    fn page_label(&self, n: usize) -> String {
-        if self.ja {
-            format!("{n} ページ")
-        } else {
-            format!("Page {n}")
-        }
-    }
-
-    fn page_alt(&self, n: usize) -> String {
-        self.page_label(n)
-    }
-
-    fn art_alt(&self, n: usize) -> String {
-        if self.ja {
-            format!("{n} ページから取り出した画像")
-        } else {
-            format!("Artwork from page {n}")
-        }
-    }
-
-    fn bands(&self, n: usize) -> String {
-        if self.ja {
-            format!("{} {n} 枚", self.bands_one)
-        } else {
-            format!("{n} {}", self.bands_one)
-        }
-    }
-
-    /// The pictures are shown in container order, not where they sat on the
-    /// page: their positions live inside the coding this crate does not read.
-    fn art_note(&self, n: usize) -> String {
-        if self.ja {
-            format!("{} — {n} 点（元の配置・向きではありません）", self.art_one)
-        } else {
-            format!(
-                "{} — {n} item(s), not in their original positions",
-                self.art_one
-            )
-        }
-    }
-
-    fn count(&self, got: usize, total: usize) -> String {
-        if self.ja {
-            format!("{total} ページ中 {got} ページを復元")
-        } else {
-            format!("{got} of {total} pages recovered")
-        }
-    }
-
-    fn gap_count(&self, n: usize) -> String {
-        if self.ja {
-            format!("{n} ページは未復元")
-        } else {
-            format!("{n} not recovered")
         }
     }
 }
@@ -810,7 +675,7 @@ fn draw_metafile_with_viewbox(
                     img.width() + 0.5,
                     img.height() + 0.5,
                     clip_attr(img.clip_path),
-                    esc(&t.art_alt(no))
+                    esc(t.art_alt)
                 ));
                 drawn += 1;
             }
@@ -1014,7 +879,7 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
     let turned = p.rotation % 180 == 90;
     let (shown_w, shown_h) = if turned { (ph, pw) } else { (pw, ph) };
     body.push_str(&format!(
-        "<figure class=\"page\" id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet{}\" style=\"aspect-ratio:{:.4}\">\n{svg}{spans}</div>\n</div>\n<figcaption>{}</figcaption>\n</figure>\n",
+        "<figure id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet{}\" style=\"aspect-ratio:{:.4}\">\n{svg}{spans}</div>\n</div>\n</figure>\n",
         shown_w / shown_h,
         match p.rotation % 360 {
             90 => " turn90",
@@ -1023,7 +888,6 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
             _ => "",
         },
         pw / ph,
-        esc(&t.page_label(no))
     ));
     Some((glyphs, pictures))
 }
@@ -1069,7 +933,7 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
                     place.y * 100.0,
                     place.w * 100.0,
                     place.h * 100.0,
-                    esc(&t.page_alt(no)),
+                    esc(t.page_alt),
                     b64(&data[offset..offset + len]),
                 ));
                 pictures += 1;
@@ -1150,10 +1014,11 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
     // `DisplayPage::paper` already describes the final displayed sheet.  A
     // rotated member is turned inside the sheet by `.turn90`/`.turn270`; do
     // not swap the outer frame as well, or an A3 landscape sheet becomes a
-    // portrait card with large empty margins.
+    // portrait page with large empty margins.  Keep the displayed paper
+    // proportions for the outer frame.
     let (shown_w, shown_h) = (pw, ph);
     body.push_str(&format!(
-        "<figure class=\"page\" id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet{}\" style=\"aspect-ratio:{:.4}\">\n{svg}{spans}</div>\n</div>\n<figcaption>{}</figcaption>\n</figure>\n",
+        "<figure id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet{}\" style=\"aspect-ratio:{:.4}\">\n{svg}{spans}</div>\n</div>\n</figure>\n",
         shown_w / shown_h,
         match display.rotation % 360 {
             90 => " turn90",
@@ -1162,7 +1027,6 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
             _ => "",
         },
         pw / ph,
-        esc(&t.page_label(no)),
     ));
     Some((glyphs, pictures))
 }
@@ -1249,7 +1113,7 @@ fn text_bounds(meta: &Metafile) -> Option<(f32, f32, f32)> {
 }
 
 /// The plain-JPEG artwork that belongs to one sheet, as figures.
-fn artwork(data: &[u8], doc: &Document, index: usize, no: usize, t: &Text) -> (String, usize) {
+fn artwork(data: &[u8], doc: &Document, index: usize, t: &Text) -> (String, usize) {
     let mut art = String::new();
     let mut count = 0usize;
     for run in doc.picture_runs(index) {
@@ -1264,27 +1128,15 @@ fn artwork(data: &[u8], doc: &Document, index: usize, no: usize, t: &Text) -> (S
             continue;
         }
         count += bands.len();
-        let w = run[0].pixels.map(|(w, _)| w).unwrap_or(0);
-        let h: u32 = run
-            .iter()
-            .map(|pic| pic.pixels.map(|(_, h)| h).unwrap_or(0))
-            .sum();
         art.push_str("<figure class=\"art\"><div class=\"bands\">\n");
         for (offset, len) in &bands {
             art.push_str(&format!(
                 "<img loading=\"lazy\" alt=\"{}\" src=\"data:image/jpeg;base64,{}\">\n",
-                esc(&t.art_alt(no)),
+                esc(t.art_alt),
                 b64(&data[*offset..*offset + *len]),
             ));
         }
-        art.push_str(&format!(
-            "</div><figcaption>{w}&times;{h}px{}</figcaption></figure>\n",
-            if bands.len() > 1 {
-                format!(" &middot; {}", t.bands(bands.len()))
-            } else {
-                String::new()
-            }
-        ));
+        art.push_str("</div></figure>\n");
     }
     (art, count)
 }
@@ -1389,5 +1241,10 @@ mod tests {
         assert_eq!(report.embedded, 1);
         assert_eq!(report.gaps, 0);
         assert!(html.contains(">A</span>"));
+        assert!(html.contains("<title>document</title>"));
+        assert!(!html.contains("<h1>"));
+        assert!(!html.contains("class=\"page\""));
+        assert!(!html.contains("<figcaption>"));
+        assert!(!html.contains("pages recovered"));
     }
 }

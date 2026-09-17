@@ -736,11 +736,18 @@ where
                         continue;
                     }
 
-                    // Contain-fit, never enlarging: an image smaller than the sheet
-                    // keeps its own size rather than being blown up.
-                    let scale = (pw / natural.0).min(ph / natural.1).min(1.0);
-                    let (dw, dh) = (natural.0 * scale, natural.1 * scale);
-                    let dy = (ph - dh) / 2.0;
+                    // The paper frame is authoritative for the PDF page, but it
+                    // is not necessarily the same shape as the JPEG.  In
+                    // particular, some kind-5 pages carry an A4 frame around a
+                    // landscape image.  Size the image from its pixel aspect
+                    // ratio and contain it in the page so the pixels are never
+                    // stretched.
+                    let source_frame = if p.paper.is_some() {
+                        contained_size(natural, (w_px as f32, h_px as f32))
+                    } else {
+                        natural
+                    };
+                    let image_place = fit_image_place(Place::sheet(pw, ph), source_frame, false);
                     let space = match info.map(|i| i.components).unwrap_or(3) {
                         1 => "/DeviceGray",
                         4 => "/DeviceCMYK",
@@ -759,14 +766,23 @@ where
                     // the sheet takes the upper part of the page and they follow.
                     let runs = doc.picture_runs(p.index);
                     let mut xobjects = format!("/Im0 {img} 0 R ");
-                    let (dw, dh, dy) = if runs.is_empty() {
-                        (dw, dh, dy)
+                    let (dw, dh, dx, dy) = if runs.is_empty() {
+                        (
+                            image_place.w,
+                            image_place.h,
+                            image_place.x,
+                            ph - image_place.top - image_place.h,
+                        )
                     } else {
-                        let k = (ph * 0.52) / dh.max(0.01);
+                        let k = (ph * 0.52) / image_place.h.max(0.01);
                         let k = k.min(1.0);
-                        (dw * k, dh * k, ph - margin_of(pw, ph) - dh * k)
+                        (
+                            image_place.w * k,
+                            image_place.h * k,
+                            (pw - image_place.w * k) / 2.0,
+                            ph - margin_of(pw, ph) - image_place.h * k,
+                        )
                     };
-                    let dx = (pw - dw) / 2.0;
                     let mut content =
                         format!("q {dw:.2} 0 0 {dh:.2} {dx:.2} {dy:.2} cm /Im0 Do Q\n");
                     if !runs.is_empty() {
@@ -1496,6 +1512,60 @@ impl Place {
     }
 }
 
+/// Largest rectangle with `image`'s aspect ratio that fits inside `frame`.
+///
+/// A page's paper frame and its recovered JPEG do not always agree.  Keep the
+/// paper for the page itself, but use the actual image dimensions for the
+/// rectangle that receives the pixels.
+fn contained_size(frame: (f32, f32), image: (f32, f32)) -> (f32, f32) {
+    if !(frame.0.is_finite()
+        && frame.1.is_finite()
+        && image.0.is_finite()
+        && image.1.is_finite()
+        && frame.0 > 0.0
+        && frame.1 > 0.0
+        && image.0 > 0.0
+        && image.1 > 0.0)
+    {
+        return frame;
+    }
+    let scale = (frame.0 / image.0).min(frame.1 / image.1);
+    (image.0 * scale, image.1 * scale)
+}
+
+/// Fit an image frame into a placement rectangle, preserving its aspect
+/// ratio.  `allow_upscale` is false for standalone page images so a tiny
+/// source is not enlarged merely because the output paper is larger.
+fn fit_image_place(place: Place, image: (f32, f32), allow_upscale: bool) -> Place {
+    if !(image.0.is_finite()
+        && image.1.is_finite()
+        && image.0 > 0.0
+        && image.1 > 0.0
+        && place.w.is_finite()
+        && place.h.is_finite()
+        && place.w > 0.0
+        && place.h > 0.0)
+    {
+        return place;
+    }
+    let mut scale = (place.w / image.0).min(place.h / image.1);
+    if !allow_upscale {
+        scale = scale.min(1.0);
+    }
+    if !(scale.is_finite() && scale > 0.0) {
+        return place;
+    }
+    let w = image.0 * scale;
+    let h = image.1 * scale;
+    Place {
+        x: place.x + (place.w - w) * 0.5,
+        top: place.top + (place.h - h) * 0.5,
+        w,
+        h,
+        ph: place.ph,
+    }
+}
+
 /// PDFの描画状態に適用する2次元変換。
 #[derive(Debug, Clone, Copy)]
 struct PdfMatrix {
@@ -1525,7 +1595,78 @@ fn oriented_image_place(
     frame: (f32, f32),
     rotation: u16,
 ) -> (Place, Option<PdfMatrix>) {
-    oriented_content_place(place, frame, rotation)
+    let rotation = rotation % 360;
+    if !(frame.0.is_finite() && frame.1.is_finite() && frame.0 > 0.0 && frame.1 > 0.0) {
+        return (place, None);
+    }
+    let (shown_w, shown_h) = if rotation % 180 == 90 {
+        (frame.1, frame.0)
+    } else if rotation == 0 || rotation == 180 {
+        frame
+    } else {
+        return (place, None);
+    };
+    let scale = (place.w / shown_w).min(place.h / shown_h);
+    if !(scale.is_finite() && scale > 0.0) {
+        return (place, None);
+    }
+    let local_w = frame.0 * scale;
+    let local_h = frame.1 * scale;
+    let shown_w = shown_w * scale;
+    let shown_h = shown_h * scale;
+    let left = place.x + (place.w - shown_w) * 0.5;
+    let top = place.top + (place.h - shown_h) * 0.5;
+    if rotation == 0 {
+        return (
+            Place {
+                x: left,
+                top,
+                w: local_w,
+                h: local_h,
+                ph: place.ph,
+            },
+            None,
+        );
+    }
+
+    let local = Place {
+        x: 0.0,
+        top: 0.0,
+        w: local_w,
+        h: local_h,
+        ph: local_h,
+    };
+    let top_pdf = place.ph - top;
+    let matrix = match rotation {
+        // 時計回り90度: (x, y) -> (height - y, x) in top-down coordinates.
+        90 => PdfMatrix {
+            a: 0.0,
+            b: -1.0,
+            c: 1.0,
+            d: 0.0,
+            e: left,
+            f: top_pdf,
+        },
+        180 => PdfMatrix {
+            a: -1.0,
+            b: 0.0,
+            c: 0.0,
+            d: -1.0,
+            e: left + local_w,
+            f: top_pdf,
+        },
+        // 反時計回り90度: (x, y) -> (y, width - x) in top-down coordinates.
+        270 => PdfMatrix {
+            a: 0.0,
+            b: 1.0,
+            c: -1.0,
+            d: 0.0,
+            e: left + local_h,
+            f: top_pdf - local_w,
+        },
+        _ => unreachable!("rotation was normalized above"),
+    };
+    (local, Some(matrix))
 }
 
 fn oriented_content_place(
@@ -2837,7 +2978,10 @@ impl Writer {
 mod tests {
     use super::mask_alpha;
     use super::should_draw_source_invert;
-    use super::{oriented_place, pdf_paper_points, Place};
+    use super::{
+        contained_size, fit_image_place, oriented_image_place, oriented_place, pdf_paper_points,
+        Place,
+    };
     use crate::domain::rendering::Raster;
     use crate::domain::rendering::{Metafile, RasterOp};
 
@@ -2915,5 +3059,35 @@ mod tests {
         );
         assert!((matrix.e - 0.0).abs() < 0.01);
         assert!((matrix.f - 841.92).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_jpeg_with_a_different_aspect_ratio_is_contained_in_its_paper() {
+        let paper = (595.32, 841.92);
+        let source = contained_size(paper, (700.0, 500.0));
+        let placed = fit_image_place(Place::sheet(paper.0, paper.1), source, false);
+
+        assert!((placed.w - 595.32).abs() < 0.01);
+        assert!((placed.h - 425.23).abs() < 0.01);
+        assert!((placed.w / placed.h - 1.4).abs() < 0.001);
+        assert!((placed.top - 208.35).abs() < 0.02);
+    }
+
+    #[test]
+    fn a_composed_jpeg_is_contained_in_its_destination_area() {
+        let target = Place {
+            x: 10.0,
+            top: 20.0,
+            w: 100.0,
+            h: 200.0,
+            ph: 300.0,
+        };
+        let (placed, matrix) = oriented_image_place(target, (200.0, 100.0), 0);
+
+        assert!(matrix.is_none());
+        assert!((placed.x - 10.0).abs() < 0.01);
+        assert!((placed.top - 95.0).abs() < 0.01);
+        assert!((placed.w - 100.0).abs() < 0.01);
+        assert!((placed.h - 50.0).abs() < 0.01);
     }
 }

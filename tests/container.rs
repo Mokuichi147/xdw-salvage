@@ -278,6 +278,22 @@ fn nested_kind5_jpeg_is_recoverable() {
 }
 
 #[test]
+fn a_jpeg_page_keeps_its_pixel_ratio_when_its_paper_frame_differs() {
+    // The kind-5 metadata says A4, while the recovered JPEG is landscape. The
+    // page remains A4, but the image matrix must use the JPEG's own ratio.
+    let file = container(10, 0x68, vec![kind5_jpeg_page(700, 500)], &[]);
+    let doc = parse(&file).expect("parses");
+    let (bytes, report) = pdf::build(&file, &doc, pdf::Options::default());
+
+    assert_eq!(report.embedded, 1);
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("q 595.32 0 0 425.23 "),
+        "the JPEG was stretched to the paper frame: {text:.0}"
+    );
+}
+
+#[test]
 fn consecutive_kind5_jpegs_remain_separate_pages() {
     let first = tiny_jpeg(600, 800);
     let second = tiny_jpeg(700, 500);
@@ -1109,7 +1125,7 @@ fn html_can_drop_the_missing_pages_instead() {
     let (page, report) = xdw_salvage::adapters::html::build(&bytes, &doc, &opts);
     assert_eq!(report.gaps, 0);
     assert_eq!(report.skipped, 1);
-    assert!(!page.contains("class=\"page gap\""));
+    assert!(!page.contains("class=\"gap\""));
 }
 
 #[test]
@@ -1125,6 +1141,11 @@ fn html_escapes_a_hostile_title() {
         !page.contains("<script>alert"),
         "a file name went into the page as markup"
     );
+    assert!(page.contains("<title>&lt;script&gt;alert(1)&lt;/script&gt;</title>"));
+    assert!(!page.contains("<h1>"));
+    assert!(!page.contains("pages recovered"));
+    assert!(!page.contains("class=\"page\""));
+    assert!(!page.contains("<figcaption>"));
     assert!(page.contains("&lt;script&gt;"));
 }
 
