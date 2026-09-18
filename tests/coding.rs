@@ -503,16 +503,16 @@ fn an_embedded_bitmap_is_decoded_and_placed() {
     let mut r = Vec::new();
     let put = |v: i32, r: &mut Vec<u8>| r.extend_from_slice(&v.to_le_bytes());
     for v in [0, 0, 0, 0] {
-        put(v, &mut r); // rclBounds
+        put(v, &mut r); // 描画範囲（rclBounds）
     }
     for v in [100, 200, 0, 0, 2, 2] {
         put(v, &mut r); // xDest, yDest, xSrc, ySrc, cxSrc, cySrc
     }
     let header_at = 8 + 72; // after the fixed part of the record
     let info_len = 40 + 256 * 4;
-    put(header_at, &mut r); // offBmiSrc
-    put(info_len, &mut r); // cbBmiSrc
-    put(header_at + info_len, &mut r); // offBitsSrc
+    put(header_at, &mut r); // DIB情報の位置（offBmiSrc）
+    put(info_len, &mut r); // DIB情報の長さ（cbBmiSrc）
+    put(header_at + info_len, &mut r); // 画素データの位置（offBitsSrc）
     put(8, &mut r); // cbBitsSrc: two rows padded to four bytes
     put(0, &mut r); // usage
     put(0x00CC_0020u32 as i32, &mut r); // SRCCOPY
@@ -546,6 +546,51 @@ fn an_embedded_bitmap_is_decoded_and_placed() {
         (i.left, i.top, i.right, i.bottom),
         (100.0, 200.0, 104.0, 204.0)
     );
+}
+
+#[test]
+fn a_paletted_srcand_dib_is_kept_as_a_raster() {
+    // 一部のプリンタードライバーは1ビットマスクではなく4ビットDIBにSRCANDを
+    // 使う。白紙上で見える画像なので、宛先画素とのANDを再現できないことだけを
+    // 理由に拒否してはならない。
+    let mut f = metafile_with_text(b"x", 0, 0);
+    let mut r = Vec::new();
+    let put = |v: i32, r: &mut Vec<u8>| r.extend_from_slice(&v.to_le_bytes());
+    for v in [0, 0, 0, 0] {
+        put(v, &mut r); // rclBounds
+    }
+    for v in [100, 200, 0, 0, 2, 1] {
+        put(v, &mut r); // xDest、yDest、xSrc、ySrc、cxSrc、cySrc
+    }
+    let header_at = 8 + 72;
+    let info_len = 40 + 16 * 4;
+    put(header_at, &mut r); // offBmiSrc
+    put(info_len, &mut r); // cbBmiSrc
+    put(header_at + info_len, &mut r); // offBitsSrc
+    put(4, &mut r); // cbBitsSrc、パディング込みの1行
+    put(0, &mut r); // 使用方法
+    put(0x0088_00C6u32 as i32, &mut r); // SRCANDのラスタ演算
+    put(2, &mut r); // 描画幅（cxDest）
+    put(1, &mut r); // 描画高さ（cyDest）
+    put(40, &mut r); // BITMAPINFOHEADERのサイズ
+    put(2, &mut r); // 幅
+    put(1, &mut r); // 高さ
+    r.extend_from_slice(&1u16.to_le_bytes());
+    r.extend_from_slice(&4u16.to_le_bytes());
+    for _ in 0..6 {
+        put(0, &mut r);
+    }
+    for i in 0..16u8 {
+        r.extend_from_slice(&[i, i, i, 0]);
+    }
+    r.extend_from_slice(&[0x12, 0, 0, 0]);
+    push_record(&mut f, 81, &r);
+
+    let page = emf::read(&f).expect("reads");
+    assert_eq!(page.rasters.len(), 1);
+    assert_eq!(page.rasters[0].bits, 4);
+    assert_eq!(page.images.len(), 1);
+    assert!(!page.skipped.contains_key(&81));
 }
 
 #[test]
@@ -695,6 +740,118 @@ fn a_page_in_the_older_flavour_yields_text_fills_and_pictures() {
         i.source,
         rendering::Source::Stored { ordinal: 0, .. }
     ));
+}
+
+#[test]
+fn a_dibbitblt_with_an_embedded_dib_is_decoded() {
+    let mut d = Vec::new();
+    d.extend_from_slice(&words(&[1, 9, 0x300]));
+    d.extend_from_slice(&0u32.to_le_bytes());
+    d.extend_from_slice(&words(&[0]));
+    d.extend_from_slice(&0u32.to_le_bytes());
+    d.extend_from_slice(&words(&[0]));
+    wmf_record(&mut d, 0x020C, &words(&[1000, 1000]));
+
+    let mut record = 0x0088_00C6u32.to_le_bytes().to_vec(); // SRCAND
+    record.extend_from_slice(&words(&[0, 0, 2, 8, 200, 100]));
+    record.extend_from_slice(&40u32.to_le_bytes());
+    record.extend_from_slice(&8u32.to_le_bytes());
+    record.extend_from_slice(&2u32.to_le_bytes());
+    record.extend_from_slice(&1u16.to_le_bytes());
+    record.extend_from_slice(&1u16.to_le_bytes());
+    record.extend_from_slice(&[0u8; 24]);
+    record.extend_from_slice(&[0, 0, 0, 0, 255, 255, 255, 0]);
+    record.extend_from_slice(&[0xAA, 0, 0, 0, 0x55, 0, 0, 0]);
+    wmf_record(&mut d, 0x0940, &record);
+    wmf_record(&mut d, 0, &[]);
+
+    let page = wmf::read(&d, (21000, 29700)).expect("reads");
+    assert_eq!(page.rasters.len(), 1);
+    assert_eq!(page.rasters[0].width, 8);
+    assert_eq!(page.rasters[0].height, 2);
+    assert_eq!(page.images.len(), 1);
+    assert_eq!(
+        (
+            page.images[0].left,
+            page.images[0].top,
+            page.images[0].right,
+            page.images[0].bottom
+        ),
+        (100.0, 200.0, 108.0, 202.0)
+    );
+    assert!(!page.skipped.contains_key(&0x0940));
+}
+
+#[test]
+fn an_emf_bitblt_with_an_embedded_dib_is_decoded() {
+    let mut f = metafile_with_text(b"x", 0, 0);
+    let mut r = Vec::new();
+    let put = |v: i32, r: &mut Vec<u8>| r.extend_from_slice(&v.to_le_bytes());
+    for v in [0, 0, 0, 0] {
+        put(v, &mut r); // 描画範囲（rclBounds）
+    }
+    for v in [10, 20, 2, 1] {
+        put(v, &mut r); // xDest、yDest、cxDest、cyDest
+    }
+    put(0x00CC_0020u32 as i32, &mut r); // SRCCOPYのラスタ演算
+    for v in [0, 0] {
+        put(v, &mut r); // ソース位置（xSrc、ySrc）
+    }
+    for v in [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0] {
+        r.extend_from_slice(&v.to_le_bytes()); // ソース変換（xformSrc）
+    }
+    put(0, &mut r); // 背景色（crBkColorSrc）
+    put(0, &mut r); // DIBの使用方法（iUsageSrc）
+    let header_at = 8 + 92;
+    let info_len = 40 + 2 * 4;
+    put(header_at, &mut r); // DIB情報の位置（offBmiSrc）
+    put(info_len, &mut r); // DIB情報の長さ（cbBmiSrc）
+    put(header_at + info_len, &mut r); // 画素データの位置（offBitsSrc）
+    put(4, &mut r); // 画素データの長さ（cbBitsSrc）
+    put(40, &mut r); // BITMAPINFOHEADERのサイズ
+    put(2, &mut r); // 幅
+    put(1, &mut r); // 高さ
+    r.extend_from_slice(&1u16.to_le_bytes());
+    r.extend_from_slice(&1u16.to_le_bytes());
+    for _ in 0..6 {
+        put(0, &mut r);
+    }
+    r.extend_from_slice(&[0, 0, 0, 0, 255, 255, 255, 0]);
+    r.extend_from_slice(&[0x80, 0, 0, 0]);
+    push_record(&mut f, 76, &r);
+
+    let page = emf::read(&f).expect("reads");
+    assert_eq!(page.rasters.len(), 1);
+    assert_eq!(page.images.len(), 1);
+    assert_eq!(
+        (
+            page.images[0].left,
+            page.images[0].top,
+            page.images[0].right,
+            page.images[0].bottom
+        ),
+        (10.0, 20.0, 12.0, 21.0)
+    );
+    assert!(!page.skipped.contains_key(&76));
+}
+
+#[test]
+fn a_roundrect_becomes_a_rounded_path() {
+    let mut d = Vec::new();
+    d.extend_from_slice(&words(&[1, 9, 0x300]));
+    d.extend_from_slice(&0u32.to_le_bytes());
+    d.extend_from_slice(&words(&[0]));
+    d.extend_from_slice(&0u32.to_le_bytes());
+    d.extend_from_slice(&words(&[0]));
+    wmf_record(&mut d, 0x020C, &words(&[1000, 1000]));
+    wmf_record(&mut d, 0x061C, &words(&[8, 10, 80, 100, 20, 10]));
+    wmf_record(&mut d, 0, &[]);
+
+    let page = wmf::read(&d, (21000, 29700)).expect("reads");
+    assert_eq!(page.shapes.len(), 1);
+    assert_eq!(page.shapes[0].path.figures[0].segments.len(), 8);
+    assert!(page.shapes[0].path.figures[0].closed);
+    assert!(!page.skipped.contains_key(&0x061C));
 }
 
 #[test]

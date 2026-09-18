@@ -506,14 +506,14 @@ impl Canvas {
             };
             raster.stencil = Some(colour);
         } else if rop == SRCAND {
-            // The source is a monochrome mask: a zero bit clears the
-            // destination and a one bit leaves it alone.  Normalize the
-            // bitmap so bit zero is the foreground that needs to be retained
-            // by the output adapters.
-            if raster.bits != 1 {
-                return false;
+            if raster.bits == 1 {
+                // モノクロマスクでは0ビットが塗られ、1ビットが元の画素を残す。
+                // 出力アダプターが扱う極性へ正規化する。
+                normalize_and_mask(&mut raster);
             }
-            normalize_and_mask(&mut raster);
+            // 一部のプリンタードライバーは1ビットマスクではなくパレットDIBに
+            // SRCANDを使う。中立モデルでは宛先画素とのANDを再現できないが、対象
+            // レコードは白紙上の描画なので、画像を捨てず通常のラスタとして残す。
         } else if rop != SRCCOPY {
             return false;
         }
@@ -640,6 +640,65 @@ impl Canvas {
                     Segment::Curve((cx - k * rx, bottom), (left, cy + k * ry), (left, cy)),
                     Segment::Curve((left, cy - k * ry), (cx - k * rx, top), (cx, top)),
                     Segment::Curve((cx + k * rx, top), (right, cy - k * ry), (right, cy)),
+                ],
+                closed: true,
+            }],
+            even_odd: self.even_odd,
+        };
+        self.paint(path, true, true, order);
+    }
+
+    /// GDIのRoundRectに相当する、角を楕円で丸めた矩形を描画する。
+    /// GDIが渡す幅・高さは角の楕円全体の寸法なので、半分を半径にする。
+    pub fn round_rect(
+        &mut self,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        ellipse_width: i32,
+        ellipse_height: i32,
+    ) {
+        let order = self.advance();
+        let (a, b) = self.device(left, top);
+        let (c, d) = self.device(right, bottom);
+        let (left, right) = (a.min(c), a.max(c));
+        let (top, bottom) = (b.min(d), b.max(d));
+        if right <= left || bottom <= top {
+            return;
+        }
+        let (sx, sy) = self.scale();
+        let rx = (ellipse_width.unsigned_abs() as f32 * sx.abs() * 0.5).min((right - left) * 0.5);
+        let ry = (ellipse_height.unsigned_abs() as f32 * sy.abs() * 0.5).min((bottom - top) * 0.5);
+        let k = 0.552_284_8;
+        let path = Path {
+            figures: vec![Figure {
+                start: (left + rx, top),
+                segments: vec![
+                    Segment::Line((right - rx, top)),
+                    Segment::Curve(
+                        (right - rx + k * rx, top),
+                        (right, top + ry - k * ry),
+                        (right, top + ry),
+                    ),
+                    Segment::Line((right, bottom - ry)),
+                    Segment::Curve(
+                        (right, bottom - ry + k * ry),
+                        (right - rx + k * rx, bottom),
+                        (right - rx, bottom),
+                    ),
+                    Segment::Line((left + rx, bottom)),
+                    Segment::Curve(
+                        (left + rx - k * rx, bottom),
+                        (left, bottom - ry + k * ry),
+                        (left, bottom - ry),
+                    ),
+                    Segment::Line((left, top + ry)),
+                    Segment::Curve(
+                        (left, top + ry - k * ry),
+                        (left + rx - k * rx, top),
+                        (left + rx, top),
+                    ),
                 ],
                 closed: true,
             }],

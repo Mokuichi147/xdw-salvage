@@ -165,7 +165,9 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
                 }
             }
             EMR_BITBLT => {
-                if u32_at(r, 40) == Some(PATCOPY) {
+                if bit_blt(r, &mut c) {
+                    // レコード内に埋め込まれたDIBを描画した。
+                } else if u32_at(r, 40) == Some(PATCOPY) {
                     if let (Some(x), Some(y), Some(cx), Some(cy)) =
                         (i32_at(r, 24), i32_at(r, 28), i32_at(r, 32), i32_at(r, 36))
                     {
@@ -390,6 +392,51 @@ fn polygons16(r: &[u8]) -> Option<Vec<Vec<(i32, i32)>>> {
             (end == at).then_some(polygon)
         })
         .collect()
+}
+
+/// ソースDIBを持つEMR_BITBLTレコードを復号する。
+///
+/// ソース原点とビットマップオフセットの間にある6つの値はソースのワールド変換で
+/// ある。対象データでは単位変換だけが使われているため、一般のアフィン変換を
+/// 描画モデルへ追加するまでは、変換後の位置を誤って描画しないよう非単位変換を
+/// 拒否する。
+fn bit_blt(r: &[u8], c: &mut Canvas) -> bool {
+    let f = |i: usize| i32_at(r, 24 + i * 4);
+    let (Some(xd), Some(yd), Some(cxd), Some(cyd), Some(xs), Some(ys)) =
+        (f(0), f(1), f(2), f(3), i32_at(r, 44), i32_at(r, 48))
+    else {
+        return false;
+    };
+    let identity = [
+        1.0f32.to_bits(),
+        0.0f32.to_bits(),
+        0.0f32.to_bits(),
+        1.0f32.to_bits(),
+        0.0f32.to_bits(),
+        0.0f32.to_bits(),
+    ];
+    if (0..6).any(|i| u32_at(r, 52 + i * 4) != Some(identity[i])) {
+        return false;
+    }
+    let (Some(off_bmi), Some(cb_bmi), Some(off_bits), Some(cb_bits), Some(rop)) = (
+        u32_at(r, 84).map(|v| v as usize),
+        u32_at(r, 88).map(|v| v as usize),
+        u32_at(r, 92).map(|v| v as usize),
+        u32_at(r, 96).map(|v| v as usize),
+        u32_at(r, 40),
+    ) else {
+        return false;
+    };
+    if cb_bmi == 0 || cb_bits == 0 {
+        return false;
+    }
+    let (Some(info), Some(bits)) = (
+        r.get(off_bmi..off_bmi.saturating_add(cb_bmi)),
+        r.get(off_bits..off_bits.saturating_add(cb_bits)),
+    ) else {
+        return false;
+    };
+    c.stretch_dib(info, bits, (xd, yd, cxd, cyd), (xs, ys, cxd, cyd), rop)
 }
 
 fn stretch_dibits(r: &[u8], c: &mut Canvas) -> bool {

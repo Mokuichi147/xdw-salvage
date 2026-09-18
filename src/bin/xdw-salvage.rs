@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use xdw_salvage::adapters::{html, pdf};
+use xdw_salvage::application::recovery;
 use xdw_salvage::application::verification::Expectation;
 use xdw_salvage::domain::PageData;
 
@@ -806,11 +807,12 @@ fn run_manifest(files: &[String], out: Option<&Path>) -> ExitCode {
                     .size_mm(i)
                     .map(|(w, h)| (format!("{w:.1}"), format!("{h:.1}")))
                     .unwrap_or_default();
-                let recoverable = display.members.iter().any(|member| {
-                    doc.pages
-                        .get(member.page_index)
-                        .is_some_and(|page| page.is_recoverable())
-                });
+                let recoverable = recovery::display_page_is_recoverable(
+                    &asset.data,
+                    display,
+                    doc,
+                    service.decoder(),
+                );
                 csv.push_str(&format!(
                     "{},{},display,{},{},{}\n",
                     csv_field(f),
@@ -833,7 +835,7 @@ fn run_manifest(files: &[String], out: Option<&Path>) -> ExitCode {
                     p.kind_name(),
                     w,
                     h,
-                    p.is_recoverable()
+                    recovery::page_is_recoverable(&asset.data, p, doc, service.decoder())
                 ));
             }
         }

@@ -26,10 +26,12 @@ const META_POLYGON: u16 = 0x0324;
 const META_POLYLINE: u16 = 0x0325;
 const META_RECTANGLE: u16 = 0x041B;
 const META_ELLIPSE: u16 = 0x0418;
+const META_ROUNDRECT: u16 = 0x061C;
 const META_ESCAPE: u16 = 0x0626;
 const META_PATBLT: u16 = 0x061D;
 const META_TEXTOUT: u16 = 0x0521;
 const META_EXTTEXTOUT: u16 = 0x0A32;
+const META_DIBBITBLT: u16 = 0x0940;
 const META_STRETCHDIB: u16 = 0x0F43;
 const META_CREATEPENINDIRECT: u16 = 0x02FA;
 const META_CREATEFONTINDIRECT: u16 = 0x02FB;
@@ -186,6 +188,15 @@ pub fn read(d: &[u8], paper_mm100: (i32, i32)) -> Option<Metafile> {
                     c.ellipse(l, t, rt, b);
                 }
             }
+            META_ROUNDRECT => {
+                if let (Some(ry), Some(rx), Some(b), Some(rt), Some(t), Some(l)) =
+                    (p(0), p(1), p(2), p(3), p(4), p(5))
+                {
+                    c.round_rect(l, t, rt, b, rx, ry);
+                } else {
+                    c.skip(u32::from(kind));
+                }
+            }
             META_POLYGON | META_POLYLINE => {
                 if let Some(n) = u16_at(r, 6).map(usize::from) {
                     let pts: Option<Vec<(i32, i32)>> = (0..n)
@@ -208,6 +219,11 @@ pub fn read(d: &[u8], paper_mm100: (i32, i32)) -> Option<Metafile> {
             }
             META_STRETCHDIB => {
                 if !stretch_dib(r, &mut c) {
+                    c.skip(u32::from(kind));
+                }
+            }
+            META_DIBBITBLT => {
+                if !dib_bit_blt(r, &mut c) {
                     c.skip(u32::from(kind));
                 }
             }
@@ -248,6 +264,46 @@ fn create(slots: &mut Vec<bool>, c: &mut Canvas, object: Object) {
         slots[slot] = true;
     }
     c.create(slot as u32, object);
+}
+
+/// ビットマップを含む形式の`META_DIBBITBLT`を復号する。
+///
+/// 短形式にはソースDIBがないため未対応のままにする。短形式のレコードサイズは
+/// 関数値の上位バイトに3を加えたワード数である。長形式では6つの共通パラメーター
+/// の直後、レコードの22バイト目からDIBが始まる。
+fn dib_bit_blt(r: &[u8], c: &mut Canvas) -> bool {
+    let (Some(words), Some(function)) = (u32_at(r, 0), u16_at(r, 4)) else {
+        return false;
+    };
+    let words = words as usize;
+    let no_bitmap_words = usize::from(function >> 8) + 3;
+    if words == no_bitmap_words {
+        return false;
+    }
+    let (Some(ys), Some(xs), Some(h), Some(w), Some(yd), Some(xd), Some(rop)) = (
+        i16_at(r, 10).map(i32::from),
+        i16_at(r, 12).map(i32::from),
+        i16_at(r, 14).map(i32::from),
+        i16_at(r, 16).map(i32::from),
+        i16_at(r, 18).map(i32::from),
+        i16_at(r, 20).map(i32::from),
+        u32_at(r, 6),
+    ) else {
+        return false;
+    };
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    let Some(info) = r.get(22..) else {
+        return false;
+    };
+    let Some(header) = crate::infrastructure::dib::header(info) else {
+        return false;
+    };
+    let Some(bits) = info.get(header.info_len..) else {
+        return false;
+    };
+    c.stretch_dib(info, bits, (xd, yd, w, h), (xs, ys, w, h), rop)
 }
 
 fn stretch_dib(r: &[u8], c: &mut Canvas) -> bool {

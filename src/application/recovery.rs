@@ -4,7 +4,7 @@ use crate::application::ports::PageDecoder;
 use crate::domain::coverage::Coverage;
 use crate::domain::page::Page;
 use crate::domain::rendering::Metafile;
-use crate::domain::Document;
+use crate::domain::{DisplayPage, Document};
 
 /// Decode one page through the supplied port.
 ///
@@ -32,6 +32,52 @@ pub fn decode_page_for_document<D: PageDecoder + ?Sized>(
         .filter(|page| !page.is_empty())
 }
 
+/// ページ本体またはページに重ねる描画を、実際のデコーダーで回収できるか調べる。
+///
+/// `Page::is_recoverable` はコンテナ上の形式だけを判定するため、EMF/WMFを
+/// 内包する符号化ページは構造上は未回収に見える。出力アダプターと同じ判定を
+/// 監査にも使い、形式判定だけによる偽陰性を避ける。
+pub fn page_is_recoverable<D: PageDecoder + ?Sized>(
+    data: &[u8],
+    page: &Page,
+    document: &Document,
+    decoder: &D,
+) -> bool {
+    page.is_recoverable()
+        || decode_page_for_document(data, page, document, decoder).is_some()
+        || page.overlays.iter().any(|overlay| {
+            decode_overlay(decoder, overlay, page.paper.unwrap_or((21000, 29700))).is_some()
+        })
+}
+
+/// ページ重ね描画の結果を、空のモデルを除いて返す。
+pub fn decode_overlay<D: PageDecoder + ?Sized>(
+    decoder: &D,
+    overlay: &crate::domain::page::Overlay,
+    paper: (u32, u32),
+) -> Option<Metafile> {
+    decoder
+        .decode_overlay(overlay, paper)
+        .filter(|drawing| !drawing.is_empty())
+}
+
+/// 表示ページが、本文・重ね描画・明示的な空白ページのいずれかとして回収できるか調べる。
+pub fn display_page_is_recoverable<D: PageDecoder + ?Sized>(
+    data: &[u8],
+    display: &DisplayPage,
+    document: &Document,
+    decoder: &D,
+) -> bool {
+    display.members.iter().any(|member| {
+        document
+            .pages
+            .get(member.page_index)
+            .is_some_and(|page| page_is_recoverable(data, page, document, decoder))
+    }) || display.overlays.iter().any(|overlay| {
+        decode_overlay(decoder, overlay, display.paper.unwrap_or((21000, 29700))).is_some()
+    }) || (display.members.is_empty() && display.overlays.is_empty())
+}
+
 /// Calculate coverage using the structural facts in `Document` and the
 /// injected page decoder for pages held in a coded representation.
 pub fn coverage<D: PageDecoder + ?Sized>(
@@ -48,12 +94,10 @@ pub fn coverage<D: PageDecoder + ?Sized>(
         }
         // Decode once per sheet. Besides avoiding duplicate work, this keeps
         // the use case deterministic for a stateful custom decoder.
-        if decode_page(data, page, decoder).is_some() {
+        if decode_page_for_document(data, page, document, decoder).is_some() {
             decoded_sheets += 1;
         } else if page.overlays.iter().any(|overlay| {
-            decoder
-                .decode_overlay(overlay, page.paper.unwrap_or((21000, 29700)))
-                .is_some_and(|drawing| !drawing.is_empty())
+            decode_overlay(decoder, overlay, page.paper.unwrap_or((21000, 29700))).is_some()
         }) {
             // Older containers sometimes lose the page offset table while
             // retaining a complete page drawing in document properties.
