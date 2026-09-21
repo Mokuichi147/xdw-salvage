@@ -71,6 +71,18 @@ pub enum RasterOp {
     Other(u32),
 }
 
+/// Composition mode selected by the source drawing context for vector paint.
+///
+/// `Multiply` is the SVG equivalent of the GDI `R2_MASKPEN` mode used by a
+/// few annotation drawings. Keeping it on the primitive, rather than on the
+/// whole metafile, preserves a later `R2_COPYPEN` change in the same page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+}
+
 impl RasterOp {
     /// Translate the Win32 ROP3 values used by the metafile formats.
     pub fn from_code(code: u32) -> Self {
@@ -176,6 +188,8 @@ pub struct Fill {
     pub right: f32,
     pub bottom: f32,
     pub rgb: (u8, u8, u8),
+    /// How this fill combines with the pixels already painted beneath it.
+    pub blend: BlendMode,
     /// Position in the source's draw order.
     pub order: usize,
     /// The rectangle the fill was clipped to, if narrower than the page.
@@ -260,6 +274,8 @@ pub struct Shape {
     pub fill: Option<(u8, u8, u8)>,
     /// Outline colour and width in device units, if the pen draws anything.
     pub stroke: Option<((u8, u8, u8), f32)>,
+    /// How this shape combines with the pixels already painted beneath it.
+    pub blend: BlendMode,
     /// Position in the source's draw order.
     pub order: usize,
     /// The rectangle the drawing was clipped to, if narrower than the page.

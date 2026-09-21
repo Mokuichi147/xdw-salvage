@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 
 use crate::domain::rendering::{
-    Figure, Fill, FontKind, Image, Metafile, Path, Raster, RasterOp, Rect, Segment, Shape, Source,
-    Text,
+    BlendMode, Figure, Fill, FontKind, Image, Metafile, Path, Raster, RasterOp, Rect, Segment,
+    Shape, Source, Text,
 };
 use crate::infrastructure::dib;
 
@@ -135,6 +135,8 @@ pub struct Canvas {
     /// around annotation clips, so a later RestoreDC must also restore the
     /// clip and mapping before the annotation outline is painted.
     saved_states: Vec<SavedState>,
+    /// Current GDI ROP2 mode for vector paint.
+    blend: BlendMode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -153,6 +155,7 @@ struct SavedState {
     clip_logical: Option<(i32, i32, i32, i32)>,
     clip_path: Option<usize>,
     moved: Option<(i32, i32)>,
+    blend: BlendMode,
 }
 
 impl Default for Canvas {
@@ -180,6 +183,7 @@ impl Default for Canvas {
             pictures_called: 0,
             moved: Some((0, 0)),
             saved_states: Vec::new(),
+            blend: BlendMode::Normal,
         }
     }
 }
@@ -227,6 +231,7 @@ impl Canvas {
             clip_logical: self.clip_logical,
             clip_path: self.clip_path,
             moved: self.moved,
+            blend: self.blend,
         });
     }
 
@@ -259,6 +264,7 @@ impl Canvas {
         self.clip_logical = state.clip_logical;
         self.clip_path = state.clip_path;
         self.moved = state.moved;
+        self.blend = state.blend;
         // RestoreDC discards the restored level and every newer level.
         self.saved_states.truncate(index);
     }
@@ -377,6 +383,17 @@ impl Canvas {
         self.even_odd = mode != 2;
     }
 
+    /// Set the GDI ROP2 mode used by subsequent vector paint.  The source
+    /// files use `R2_MASKPEN` for translucent-looking annotation artwork;
+    /// SVG's multiply blend has the same RGB composition on the white page.
+    pub fn set_rop2(&mut self, mode: u32) {
+        self.blend = if mode == 9 {
+            BlendMode::Multiply
+        } else {
+            BlendMode::Normal
+        };
+    }
+
     /// Restrict drawing to a logical rectangle.
     pub fn set_clip_rect(&mut self, left: i32, top: i32, right: i32, bottom: i32) {
         self.clip_logical = Some((left, top, right, bottom));
@@ -473,6 +490,7 @@ impl Canvas {
             right: r,
             bottom: b,
             rgb,
+            blend: self.blend,
             order,
             clip: self.clip,
             clip_path: self.clip_path,
@@ -717,6 +735,7 @@ impl Canvas {
             path,
             fill,
             stroke,
+            blend: self.blend,
             order,
             clip: self.clip,
         });
@@ -1478,6 +1497,18 @@ mod tests {
         assert_eq!(c.page.shapes[0].fill, Some((1, 2, 3)));
         assert_eq!(c.page.shapes[0].stroke, None);
         assert_eq!(c.page.shapes[0].path.figures[0].segments.len(), 3);
+    }
+
+    #[test]
+    fn maskpen_blend_is_carried_to_vector_primitives_until_reset() {
+        let mut c = Canvas::new((100, 100), (1000, 1000));
+        c.set_rop2(9);
+        c.ellipse(10, 10, 40, 40);
+        c.set_rop2(13);
+        c.ellipse(50, 50, 80, 80);
+
+        assert_eq!(c.page.shapes[0].blend, BlendMode::Multiply);
+        assert_eq!(c.page.shapes[1].blend, BlendMode::Normal);
     }
 
     #[test]

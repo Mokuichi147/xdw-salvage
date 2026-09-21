@@ -17,6 +17,7 @@ const EMR_SETVIEWPORTEXTEX: u32 = 11;
 const EMR_SETVIEWPORTORGEX: u32 = 12;
 const EMR_EOF: u32 = 14;
 const EMR_SETPOLYFILLMODE: u32 = 19;
+const EMR_SETROP2: u32 = 20;
 const EMR_SETTEXTALIGN: u32 = 22;
 const EMR_SETTEXTCOLOR: u32 = 24;
 const EMR_INTERSECTCLIPRECT: u32 = 30;
@@ -98,6 +99,7 @@ pub fn read(d: &[u8]) -> Option<Metafile> {
             EMR_SETTEXTALIGN => c.set_text_align(u32_at(r, 8).unwrap_or(0)),
             EMR_SETTEXTCOLOR => c.set_text_colour(u32_at(r, 8).unwrap_or(0)),
             EMR_SETPOLYFILLMODE => c.set_poly_fill_mode(u32_at(r, 8).unwrap_or(1)),
+            EMR_SETROP2 => c.set_rop2(u32_at(r, 8).unwrap_or(13)),
             EMR_INTERSECTCLIPRECT => {
                 if let (Some(l), Some(t), Some(rt), Some(b)) =
                     (i32_at(r, 8), i32_at(r, 12), i32_at(r, 16), i32_at(r, 20))

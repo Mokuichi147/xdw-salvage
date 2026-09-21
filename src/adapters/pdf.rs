@@ -2181,6 +2181,20 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
         painted: false,
     };
     let mut recovered = false;
+    // A stored-picture overlay already composes the display member(s). Do not
+    // also place the member JPEG as a full-sheet opaque background: that
+    // produces black or white bands outside the overlay's actual bounds.
+    let overlay_uses_stored = decode
+        && display.overlays.iter().any(|overlay| {
+            decoder
+                .decode_overlay(overlay, paper)
+                .map(|meta| {
+                    meta.images
+                        .iter()
+                        .any(|image| matches!(image.source, Source::Stored { .. }))
+                })
+                .unwrap_or(false)
+        });
 
     for (n, member) in display.members.iter().enumerate() {
         let Some(page) = doc.pages.get(member.page_index) else {
@@ -2192,6 +2206,9 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
             .unwrap_or_else(|| Place::sheet(pw, ph));
         match page.data {
             PageData::Jpeg { .. } => {
+                if overlay_uses_stored && member.area.is_none() {
+                    continue;
+                }
                 if draw_jpeg_at(
                     w,
                     data,
@@ -2428,7 +2445,19 @@ fn draw_overlay_list<D: PageDecoder + ?Sized>(
         if is_point_sized_text(overlay, &meta) {
             place = fit_text_place(place, &meta);
         }
-        let stored: &[&Page] = if overlay.area.is_none() { &group } else { &[] };
+        // A properties rectangle describes where the overlay lands, not
+        // whether its metafile references the sheet's stored pictures.  The
+        // the source record has a full-page rectangle and still calls both the
+        // background picture and the sheet picture by stored ordinal.
+        let uses_stored = meta
+            .images
+            .iter()
+            .any(|image| matches!(image.source, Source::Stored { .. }));
+        let stored: &[&Page] = if overlay.area.is_none() || uses_stored {
+            &group
+        } else {
+            &[]
+        };
         let d = draw_page(
             w,
             data,
@@ -2635,11 +2664,14 @@ fn path_ops(
 fn raster_object(w: &mut Writer, r: &Raster) -> usize {
     let body = crate::infrastructure::deflate::zlib(&r.rows);
     if r.stencil.is_some() {
-        // A stencil paints the fill colour through its zero bits.
+        // A stencil paints the fill colour through its zero bits.  In a PDF
+        // image mask the Decode array [0 1] makes raw zero samples the
+        // painted foreground; [1 0] would paint the white/background bits and
+        // turn a sparse line drawing into an opaque rectangle.
         return w.add_stream(
             format!(
                 "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ImageMask true \
-                 /BitsPerComponent 1 /Decode [1 0] /Filter /FlateDecode >>",
+                 /BitsPerComponent 1 /Decode [0 1] /Filter /FlateDecode >>",
                 r.width, r.height
             ),
             &body,

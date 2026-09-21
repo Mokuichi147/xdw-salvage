@@ -13,6 +13,7 @@ const META_SETBKMODE: u16 = 0x0102;
 const META_SAVEDC: u16 = 0x001E;
 const META_RESTOREDC: u16 = 0x0127;
 const META_SETPOLYFILLMODE: u16 = 0x0106;
+const META_SETROP2: u16 = 0x0104;
 const META_SETTEXTALIGN: u16 = 0x012E;
 const META_SETTEXTCOLOR: u16 = 0x0209;
 const META_SETWINDOWORG: u16 = 0x020B;
@@ -112,6 +113,7 @@ pub fn read(d: &[u8], paper_mm100: (i32, i32)) -> Option<Metafile> {
             META_SETTEXTALIGN => c.set_text_align(u16_at(r, 6).map(u32::from).unwrap_or(0)),
             META_SETTEXTCOLOR => c.set_text_colour(u32_at(r, 6).unwrap_or(0)),
             META_SETPOLYFILLMODE => c.set_poly_fill_mode(u16_at(r, 6).map(u32::from).unwrap_or(1)),
+            META_SETROP2 => c.set_rop2(u16_at(r, 6).map(u32::from).unwrap_or(13)),
             META_SETBKMODE => {}
             META_INTERSECTCLIPRECT => {
                 if let (Some(b), Some(rt), Some(t), Some(l)) = (p(0), p(1), p(2), p(3)) {
