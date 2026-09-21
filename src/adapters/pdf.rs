@@ -2266,6 +2266,14 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
                 if decode =>
             {
                 if let Some(meta) = recovery::decode_page_for_document(data, page, doc, decoder) {
+                    if recovery::page_body_replaced_by_vector_overlay(
+                        &meta,
+                        &display.overlays,
+                        paper,
+                        decoder,
+                    ) {
+                        continue;
+                    }
                     let stored = doc.pictures_on(page.index).collect::<Vec<_>>();
                     let mut member_content = String::new();
                     let mut member_xobjects = String::new();

@@ -3,7 +3,7 @@
 use crate::application::ports::PageDecoder;
 use crate::domain::coverage::Coverage;
 use crate::domain::page::Page;
-use crate::domain::rendering::Metafile;
+use crate::domain::rendering::{Metafile, RasterOp, Source};
 use crate::domain::{DisplayPage, Document};
 
 /// Decode one page through the supplied port.
@@ -135,6 +135,83 @@ pub fn preview_replaced_by_text_overlay<D: PageDecoder + ?Sized>(
     })
 }
 
+/// A few printer exports keep a thumbnail-sized raster as the page body while
+/// the properties stream carries the same page as a full-sheet vector
+/// overlay.  Painting both makes the raster thumbnail appear as a blurry,
+/// duplicated page beneath the sharp overlay.  The vector overlay is the
+/// authoritative rendering in that composition.
+pub fn page_body_replaced_by_vector_overlay<D: PageDecoder + ?Sized>(
+    body: &Metafile,
+    overlays: &[crate::domain::page::Overlay],
+    paper: (u32, u32),
+    decoder: &D,
+) -> bool {
+    if body.images.len() != 1
+        || body.rasters.len() != 1
+        || !body.text.is_empty()
+        || !body.fills.is_empty()
+        || !body.shapes.is_empty()
+        || !body.paths.is_empty()
+    {
+        return false;
+    }
+    let image = body.images[0];
+    if image.raster_op != RasterOp::Copy
+        || image.clip.is_some()
+        || image.clip_path.is_some()
+        || image.left.abs() > 1.0
+        || image.top.abs() > 1.0
+    {
+        return false;
+    }
+    let Source::Inline(index) = image.source else {
+        return false;
+    };
+    let Some(raster) = body.rasters.get(index) else {
+        return false;
+    };
+    let device_w = body.device.0.unsigned_abs() as f32;
+    let device_h = body.device.1.unsigned_abs() as f32;
+    if device_w <= 0.0
+        || device_h <= 0.0
+        || image.right < device_w * 0.95
+        || image.bottom < device_h * 0.95
+        || raster.width == 0
+        || raster.height == 0
+    {
+        return false;
+    }
+    // Treat only genuinely thumbnail-like page bodies as redundant.  A
+    // normal 72-dpi-or-better bitmap may be the intended page artwork even if
+    // a vector annotation is also present.
+    let paper_points = (
+        paper.0 as f32 * 72.0 / 2540.0,
+        paper.1 as f32 * 72.0 / 2540.0,
+    );
+    let dpi_x = raster.width as f32 * 72.0 / paper_points.0.max(1.0);
+    let dpi_y = raster.height as f32 * 72.0 / paper_points.1.max(1.0);
+    if dpi_x >= 72.0 || dpi_y >= 72.0 {
+        return false;
+    }
+
+    overlays.iter().any(|overlay| {
+        let covers_paper = overlay.area.is_none_or(|(x, y, w, h)| {
+            x <= paper.0 / 20
+                && y <= paper.1 / 20
+                && w >= paper.0.saturating_mul(9) / 10
+                && h >= paper.1.saturating_mul(9) / 10
+        });
+        if !covers_paper {
+            return false;
+        }
+        let Some(meta) = decoder.decode_overlay(overlay, paper) else {
+            return false;
+        };
+        (meta.images.is_empty() && meta.rasters.is_empty())
+            && (!meta.text.is_empty() || !meta.fills.is_empty() || !meta.shapes.is_empty())
+    })
+}
+
 /// Calculate coverage using the structural facts in `Document` and the
 /// injected page decoder for pages held in a coded representation.
 pub fn coverage<D: PageDecoder + ?Sized>(
@@ -198,5 +275,97 @@ impl<'a, D: PageDecoder + ?Sized> RecoveryView<'a, D> {
 
     pub fn coverage(&self) -> Coverage {
         coverage(self.data, self.document, self.decoder)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::ports::PageDecoder;
+    use crate::domain::page::Overlay;
+    use crate::domain::rendering::{FontKind, Image, Raster, Text};
+
+    struct VectorOverlay;
+
+    impl PageDecoder for VectorOverlay {
+        fn decode(&self, _data: &[u8], _page: &Page) -> Option<Metafile> {
+            None
+        }
+
+        fn decode_overlay(&self, _overlay: &Overlay, _paper: (u32, u32)) -> Option<Metafile> {
+            Some(Metafile {
+                text: vec![Text {
+                    xs: vec![0.0],
+                    y: 1.0,
+                    chars: vec!['x'],
+                    font_kind: FontKind::Latin,
+                    size: 1.0,
+                    escapement: 0,
+                    rgb: (0, 0, 0),
+                    order: 0,
+                    bold: false,
+                    underline: false,
+                }],
+                ..Metafile::default()
+            })
+        }
+    }
+
+    fn thumbnail_body(width: u32, height: u32) -> Metafile {
+        Metafile {
+            device: (width as i32, height as i32),
+            frame_mm100: (21000, 29700),
+            images: vec![Image {
+                left: 0.0,
+                top: 0.0,
+                right: width as f32,
+                bottom: height as f32,
+                src: (width, height),
+                source: Source::Inline(0),
+                raster_op: RasterOp::Copy,
+                order: 0,
+                clip: None,
+                clip_path: None,
+            }],
+            rasters: vec![Raster {
+                width,
+                height,
+                bits: 8,
+                palette: Vec::new(),
+                rows: Vec::new(),
+                stencil: None,
+            }],
+            ..Metafile::default()
+        }
+    }
+
+    fn full_sheet_overlay() -> Overlay {
+        Overlay {
+            kind: 1,
+            expanded: 0,
+            coded: Vec::new(),
+            pixels: None,
+            area: Some((0, 0, 21000, 29700)),
+        }
+    }
+
+    #[test]
+    fn thumbnail_page_body_is_replaced_by_full_sheet_vector_overlay() {
+        assert!(page_body_replaced_by_vector_overlay(
+            &thumbnail_body(104, 146),
+            &[full_sheet_overlay()],
+            (21000, 29700),
+            &VectorOverlay,
+        ));
+    }
+
+    #[test]
+    fn page_sized_bitmap_is_not_replaced_by_vector_overlay() {
+        assert!(!page_body_replaced_by_vector_overlay(
+            &thumbnail_body(2480, 3508),
+            &[full_sheet_overlay()],
+            (21000, 29700),
+            &VectorOverlay,
+        ));
     }
 }

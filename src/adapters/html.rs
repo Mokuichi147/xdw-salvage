@@ -10,7 +10,8 @@ use crate::application::recovery;
 use crate::domain::output::Language as Lang;
 use crate::domain::page::{Page, PageData};
 use crate::domain::rendering::{
-    self, BlendMode, Fill, Image, Metafile, Raster, RasterOp, Rect, Segment, Shape, Source,
+    self, BlendMode, Fill, FontKind, Image, Metafile, Raster, RasterOp, Rect, Segment, Shape,
+    Source,
 };
 use crate::domain::{DisplayPage, Document};
 use crate::infrastructure::{png, LzhMetafileDecoder, MagicAttachmentScanner};
@@ -550,10 +551,10 @@ struct HtmlOverlay {
     drawn: HtmlDrawn,
 }
 
-/// Draw one metafile into a sheet: everything but the text goes into one
-/// SVG element in the metafile's own device units, so pictures, fills, clip
-/// paths and outlines need no conversion; the text goes down as positioned
-/// spans over it, so it stays selectable and searchable.
+/// Draw one metafile into a sheet in the metafile's own device units, so
+/// pictures, fills, clip paths, outlines, and text all scale together. SVG
+/// text remains selectable and searchable without relying on browser-specific
+/// container query units.
 ///
 /// Returns the characters and artwork that were actually placed.
 #[allow(clippy::too_many_arguments)]
@@ -566,9 +567,9 @@ fn draw_metafile(
     no: usize,
     t: &Text,
     svg: &mut String,
-    spans: &mut String,
+    _spans: &mut String,
 ) -> HtmlDrawn {
-    draw_metafile_with_viewbox(m, data, stored, place, tag, no, t, svg, spans, None)
+    draw_metafile_with_viewbox(m, data, stored, place, tag, no, t, svg, _spans, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -581,7 +582,7 @@ fn draw_metafile_with_viewbox(
     no: usize,
     t: &Text,
     svg: &mut String,
-    spans: &mut String,
+    _spans: &mut String,
     viewbox: Option<Rect>,
 ) -> HtmlDrawn {
     let (dw, dh) = (m.device.0 as f32, m.device.1 as f32);
@@ -593,6 +594,13 @@ fn draw_metafile_with_viewbox(
         .map(|r| (r.left, r.top, r.width(), r.height()))
         .unwrap_or((0.0, 0.0, dw, dh));
     let upright_vertical = m.uses_upright_vertical_text();
+    // Some printer drivers emit both the visible glyph outline and a second,
+    // black text record for searching. Painting both records makes the HTML
+    // look doubled (and can turn white headings black). Keep the text node for
+    // searching, but make it transparent when its glyph box is already covered
+    // by a matching vector shape.
+    let (text_mask, text_count, covered_count) = vector_text_mask(m);
+    let hide_vector_text = text_count >= 3 && covered_count * 4 >= text_count * 3;
     // Pair the stored pictures the page names with the ones beside the sheet.
     let calls: Vec<(usize, (u32, u32))> = {
         let mut v: Vec<(usize, (u32, u32))> = m
@@ -884,61 +892,71 @@ fn draw_metafile_with_viewbox(
         }
     }
     set_rect(svg, None, &mut open_rect);
-    svg.push_str("</svg>\n");
 
     let mut placed = 0usize;
-    for run in &m.text {
+    for (run_index, run) in m.text.iter().enumerate() {
         if run.chars.iter().all(|c| c.is_whitespace()) {
             continue;
         }
         let size = run.size;
+        if !size.is_finite() || size <= 0.0 {
+            continue;
+        }
         let text_y = if upright_vertical {
             run.y + size * 0.8
         } else {
             run.y
         };
-        let top = place.y + (text_y - size - origin_y) / view_h * place.h;
-        let (r, g, b) = run.rgb;
-        let colour = if (r, g, b) == (0, 0, 0) {
-            String::new()
-        } else {
-            format!("color:#{r:02x}{g:02x}{b:02x};")
-        };
-        let weight = if run.bold { "font-weight:bold;" } else { "" };
-        let line = if run.underline {
-            "text-decoration:underline;"
+        if !text_y.is_finite() {
+            continue;
+        }
+        let family = html_font_family(run.font_kind);
+        let weight = if run.bold {
+            " font-weight=\"bold\""
         } else {
             ""
         };
-        // Turned text is rotated about its own start, as the metafile means it.
-        let turn = if run.escapement != 0 && !upright_vertical {
-            format!(
-                "transform:rotate({:.1}deg);transform-origin:0 100%;",
-                -(run.escapement as f32) / 10.0
-            )
+        let line = if run.underline {
+            " text-decoration=\"underline\""
         } else {
-            String::new()
+            ""
         };
         for (i, c) in run.chars.iter().enumerate() {
             if c.is_whitespace() {
                 continue;
             }
-            let left = (place.x
-                + (run.xs.get(i).copied().unwrap_or(0.0) - origin_x) / view_w * place.w)
-                * 100.0;
-            let top = top * 100.0;
-            if !left.is_finite() || !top.is_finite() {
+            let Some(&x) = run.xs.get(i) else {
+                continue;
+            };
+            if !x.is_finite() {
                 continue;
             }
-            spans.push_str(&format!(
-                "<span style=\"left:{left:.3}%;top:{top:.3}%;font-size:{:.3}cqh;{colour}{weight}{line}{turn}\">{}</span>",
-                size / view_h * place.h * 100.0,
+            let covered = hide_vector_text
+                && text_mask
+                    .get(run_index)
+                    .and_then(|mask| mask.get(i))
+                    .copied()
+                    .unwrap_or(false);
+            // Turned text is rotated about its own baseline start, as the
+            // metafile means it. SVG's y-down coordinate system matches the
+            // CSS rotation sign used by the former positioned text layer.
+            let turn = if run.escapement != 0 && !upright_vertical {
+                format!(
+                    " transform=\"rotate({:.1} {x:.3} {text_y:.3})\"",
+                    -(run.escapement as f32) / 10.0
+                )
+            } else {
+                String::new()
+            };
+            svg.push_str(&format!(
+                "<text x=\"{x:.3}\" y=\"{text_y:.3}\" font-size=\"{size:.3}\" font-family=\"{family}\" fill=\"{}\"{weight}{line}{turn}>{}</text>\n",
+                if covered { "none".to_string() } else { hex(run.rgb) },
                 esc(&c.to_string())
             ));
             placed += 1;
         }
-        spans.push('\n');
     }
+    svg.push_str("</svg>\n");
     drawn.glyphs = placed;
     drawn.painted |= placed > 0;
     drawn
@@ -946,6 +964,91 @@ fn draw_metafile_with_viewbox(
 
 fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// Find text characters whose visible glyph is already present as a vector
+/// shape. Large background rectangles and rules are ignored by requiring the
+/// shape bounds to be comparable to one character's bounds.
+fn vector_text_mask(meta: &Metafile) -> (Vec<Vec<bool>>, usize, usize) {
+    let shapes: Vec<Rect> = meta
+        .shapes
+        .iter()
+        .filter_map(|shape| shape.path.bounds())
+        .filter(|bounds| {
+            bounds.left.is_finite()
+                && bounds.top.is_finite()
+                && bounds.right.is_finite()
+                && bounds.bottom.is_finite()
+                && bounds.width() > 0.0
+                && bounds.height() > 0.0
+        })
+        .collect();
+    let mut mask = Vec::with_capacity(meta.text.len());
+    let mut text_count = 0usize;
+    let mut covered_count = 0usize;
+    for run in &meta.text {
+        let mut run_mask = Vec::with_capacity(run.chars.len());
+        for (i, ch) in run.chars.iter().enumerate() {
+            let covered = run
+                .xs
+                .get(i)
+                .copied()
+                .filter(|x| x.is_finite())
+                .is_some_and(|x| {
+                    let width = run.size * if (*ch as u32) < 0x100 { 0.55 } else { 1.0 };
+                    let text = Rect {
+                        left: x,
+                        top: run.y - run.size,
+                        right: x + width,
+                        bottom: run.y,
+                    };
+                    shapes
+                        .iter()
+                        .any(|shape| shape_covers_text(*shape, text, run.size))
+                });
+            run_mask.push(covered);
+            if !ch.is_whitespace() {
+                text_count += 1;
+                covered_count += usize::from(covered);
+            }
+        }
+        mask.push(run_mask);
+    }
+    (mask, text_count, covered_count)
+}
+
+fn shape_covers_text(shape: Rect, text: Rect, size: f32) -> bool {
+    if !size.is_finite() || size <= 0.0 {
+        return false;
+    }
+    let shape_width = shape.width();
+    let shape_height = shape.height();
+    if shape_width > size * 1.5 || shape_height > size * 1.5 {
+        return false;
+    }
+    let left = shape.left.max(text.left);
+    let top = shape.top.max(text.top);
+    let right = shape.right.min(text.right);
+    let bottom = shape.bottom.min(text.bottom);
+    let intersection = (right - left).max(0.0) * (bottom - top).max(0.0);
+    let text_area = text.width() * text.height();
+    text_area > 0.0 && intersection >= text_area * 0.01
+}
+
+/// Keep the source face's metrics and glyph design when the browser has the
+/// corresponding Japanese font installed. The generic fallbacks still make
+/// the HTML readable on systems without the Windows or macOS face.
+fn html_font_family(kind: FontKind) -> &'static str {
+    match kind {
+        FontKind::Latin => "Arial, Helvetica, sans-serif",
+        FontKind::Japanese => "MS Mincho, Hiragino Mincho ProN, Yu Mincho, Noto Serif JP, serif",
+        FontKind::JapaneseProportional => {
+            "MS PMincho, Hiragino Mincho ProN, Yu Mincho, Noto Serif JP, serif"
+        }
+        FontKind::JapaneseProportionalGothic => {
+            "MS PGothic, Hiragino Kaku Gothic ProN, Yu Gothic, Meiryo, Noto Sans JP, sans-serif"
+        }
+    }
 }
 
 fn blend_attr(mode: BlendMode) -> &'static str {
@@ -1350,6 +1453,14 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
                 else {
                     continue;
                 };
+                if recovery::page_body_replaced_by_vector_overlay(
+                    &meta,
+                    &display.overlays,
+                    paper,
+                    decoder,
+                ) {
+                    continue;
+                }
                 let stored: Vec<&Page> = doc.pictures_on(page.index).collect();
                 let member_drawn = draw_metafile_with_viewbox(
                     &meta,
@@ -1799,6 +1910,63 @@ mod tests {
     }
 
     #[test]
+    fn vectorized_text_is_kept_searchable_without_painting_it_twice() {
+        let glyph = |x: f32| Shape {
+            path: Path {
+                figures: vec![Figure {
+                    start: (x, 20.0),
+                    segments: vec![
+                        Segment::Line((x + 5.0, 20.0)),
+                        Segment::Line((x + 5.0, 30.0)),
+                        Segment::Line((x, 30.0)),
+                    ],
+                    closed: true,
+                }],
+                even_odd: false,
+            },
+            fill: Some((0, 0, 255)),
+            stroke: None,
+            blend: crate::domain::rendering::BlendMode::Normal,
+            order: 0,
+            clip: None,
+        };
+        let meta = Metafile {
+            device: (100, 100),
+            frame_mm100: (21000, 21000),
+            text: vec![Text {
+                xs: vec![10.0, 20.0, 30.0],
+                y: 30.0,
+                chars: vec!['A', 'B', 'C'],
+                font_kind: crate::domain::rendering::FontKind::Latin,
+                size: 10.0,
+                escapement: 0,
+                rgb: (0, 0, 0),
+                order: 0,
+                bold: false,
+                underline: false,
+            }],
+            shapes: vec![glyph(10.0), glyph(20.0), glyph(30.0)],
+            ..Metafile::default()
+        };
+        let mut svg = String::new();
+        let mut spans = String::new();
+        let drawn = super::draw_metafile(
+            &meta,
+            &[],
+            &[],
+            super::Place::SHEET,
+            "test",
+            1,
+            &super::Text::for_lang(crate::domain::output::Language::English),
+            &mut svg,
+            &mut spans,
+        );
+        assert_eq!(drawn.glyphs, 3);
+        assert_eq!(svg.matches("fill=\"none\"").count(), 3);
+        assert!(svg.contains(">A</text>"));
+    }
+
+    #[test]
     fn properties_only_text_is_not_reported_as_a_gap() {
         let document = Document {
             generation: 7,
@@ -1847,7 +2015,8 @@ mod tests {
         );
         assert_eq!(report.embedded, 1);
         assert_eq!(report.gaps, 0);
-        assert!(html.contains(">A</span>"));
+        assert!(html.contains(">A</text>"));
+        assert!(html.contains("font-family=\"MS Mincho"));
         assert!(html.contains("<title>document</title>"));
         assert!(!html.contains("<h1>"));
         assert!(!html.contains("class=\"page\""));
@@ -1919,7 +2088,7 @@ mod tests {
         assert_eq!(report.embedded, 1);
         assert_eq!(report.glyphs, 1);
         assert!(html.contains("data:image/jpeg;base64,AQID"));
-        assert!(html.contains(">A</span>"));
+        assert!(html.contains(">A</text>"));
     }
 
     #[test]
