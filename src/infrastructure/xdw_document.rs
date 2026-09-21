@@ -87,6 +87,9 @@ pub fn parse(data: &[u8]) -> Result<Document> {
             }
         }
     }
+    // A few exports store source files or application payloads as bare LZH
+    // page entries. Keep them as data rather than phantom sheets.
+    mark_bare_data_entries(data, &mut pages);
     assign_roles(&mut pages);
 
     let stored = tlv::find_uint(&fields, data, TR_PROPS_STORED).map(|v| v as u32);
@@ -493,6 +496,44 @@ fn scan_for_pages(data: &[u8]) -> Vec<usize> {
         i += 1;
     }
     out
+}
+
+/// Identify compressed source/data files before the thumbnail grouping
+/// heuristic sees them as paperless pictures.
+fn mark_bare_data_entries(data: &[u8], pages: &mut [Page]) {
+    for page in pages {
+        let PageData::Bare { offset, len } = page.data else {
+            continue;
+        };
+        let Some(end) = offset.checked_add(len) else {
+            continue;
+        };
+        let Some(coded) = data.get(offset..end) else {
+            continue;
+        };
+        let Some(prefix) = crate::infrastructure::lzh::decode(coded, 8).ok() else {
+            continue;
+        };
+        let looks_like_pdf = prefix.starts_with(b"%PDF-");
+        let controls = prefix
+            .iter()
+            .filter(|&&byte| byte < 0x20 && !matches!(byte, b'\r' | b'\n' | b'\t'))
+            .count();
+        let printable = prefix
+            .iter()
+            .filter(|&&byte| byte >= 0x20 || matches!(byte, b'\r' | b'\n' | b'\t'))
+            .count();
+        // Older saved-over documents also leave a sizeable bare LZH stream
+        // with page metadata that is applied later in parsing.  It is an
+        // opaque vector/data payload, not a second logical sheet; tiny
+        // synthetic/unknown bare entries remain subject to the ordinary
+        // grouping heuristic.
+        let substantial_bare_payload = len >= 512;
+        if looks_like_pdf || (printable >= 6 && controls == 0) || substantial_bare_payload {
+            page.role = Role::Data;
+            page.belongs_to = None;
+        }
+    }
 }
 
 /// サムネイルを区切りとして、ページテーブル内エントリの役割を確定する。

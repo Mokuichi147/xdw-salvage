@@ -205,12 +205,12 @@ where
                     if overlay.drawn.pictures > 0 {
                         report.glyphs += overlay.drawn.glyphs;
                         report.pictures += overlay.drawn.pictures.saturating_sub(1);
-                        push_sheet_figure(p, no, pw, ph, &overlay.svg, &overlay.spans, &mut body);
+                        push_sheet_figure(p, no, pw, ph, &overlay.content, "", &mut body);
                         continue;
                     }
 
-                    let mut svg = overlay.svg;
-                    let mut spans = overlay.spans;
+                    let mut svg = overlay.content;
+                    let mut spans = String::new();
                     report.glyphs += overlay.drawn.glyphs;
                     if let Some(label) = merged_labels.get(i + 1).and_then(Option::as_ref) {
                         let place = serial_label_place(label, pw, ph);
@@ -253,7 +253,9 @@ where
                 // text rather than a note saying it could not be read. A sheet
                 // that does not expand falls through to the arm below, which still
                 // shows whatever artwork sits on it.
-                PageData::Encoded { .. } | PageData::Preview { .. } if decoded.is_some() => {
+                PageData::Encoded { .. } | PageData::Preview { .. } | PageData::Bare { .. }
+                    if decoded.is_some() =>
+                {
                     let m = decoded.as_ref().expect("decoded guard above");
                     report.embedded += 1;
                     if let Some(drawn) =
@@ -346,6 +348,10 @@ main{max-width:960px;margin:0 auto}\
 figure{margin:0 0 28px}\
 .frame{position:relative;width:100%;overflow:hidden;container-type:size}\
 .sheet{position:absolute;left:0;top:0;width:100%;background:#fff;color:#000;overflow:hidden;container-type:size}\
+.layer{position:absolute;left:0;top:0;width:100%;height:100%;overflow:hidden;container-type:size}\
+.layer.turn90{width:100cqh;height:100cqw;transform-origin:0 0;transform:translateX(100cqw) rotate(90deg)}\
+.layer.turn180{transform:rotate(180deg)}\
+.layer.turn270{width:100cqh;height:100cqw;transform-origin:0 0;transform:translateY(100cqh) rotate(-90deg)}\
 .sheet.turn90{width:100cqh;height:100cqw;transform-origin:0 0;transform:translateX(100cqw) rotate(90deg)}\
 .sheet.turn180{transform:rotate(180deg)}\
 .sheet.turn270{width:100cqh;height:100cqw;transform-origin:0 0;transform:translateY(100cqh) rotate(-90deg)}\
@@ -540,8 +546,7 @@ impl HtmlDrawn {
 /// artwork without being replaced by an annotation-only layer.
 #[derive(Debug, Default)]
 struct HtmlOverlay {
-    svg: String,
-    spans: String,
+    content: String,
     drawn: HtmlDrawn,
 }
 
@@ -1047,6 +1052,17 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
     const PT: f32 = 72.0 / 2540.0;
     let paper = p.paper.unwrap_or((21000, 29700));
     let (pw, ph) = (paper.0 as f32 * PT, paper.1 as f32 * PT);
+    let (shown_w, shown_h) = if p.rotation % 180 == 90 {
+        (ph, pw)
+    } else {
+        (pw, ph)
+    };
+    let turn = sheet_turn(p, main, shown_w, shown_h);
+    let (inner_w, inner_h) = if turn.is_none() {
+        (shown_w, shown_h)
+    } else {
+        (pw, ph)
+    };
     let mut svg = String::new();
     let mut spans = String::new();
     let mut drawn = HtmlDrawn::default();
@@ -1064,16 +1080,24 @@ fn draw_sheet<D: PageDecoder + ?Sized>(
             &mut spans,
         ));
     }
-    let overlays = draw_page_overlays(p, data, doc, decoder, no, t, pw, ph);
-    svg.push_str(&overlays.svg);
-    spans.push_str(&overlays.spans);
+    let overlays = draw_page_overlays(p, data, doc, decoder, no, t, shown_w, shown_h);
+    svg.push_str(&overlays.content);
     drawn.add(overlays.drawn);
     // A properties-only page can contain selectable text or vector shapes but
     // no picture.  Do not discard it merely because the picture count is zero.
     if main.is_none() && !drawn.painted {
         return None;
     }
-    push_sheet_figure(p, no, pw, ph, &svg, &spans, body);
+    push_sheet_figure_layout(
+        no,
+        shown_w,
+        shown_h,
+        inner_w / inner_h,
+        turn,
+        &svg,
+        &spans,
+        body,
+    );
     Some(drawn)
 }
 
@@ -1090,17 +1114,61 @@ fn push_sheet_figure(
 ) {
     let turned = p.rotation % 180 == 90;
     let (shown_w, shown_h) = if turned { (ph, pw) } else { (pw, ph) };
+    push_sheet_figure_layout(
+        no,
+        shown_w,
+        shown_h,
+        pw / ph,
+        (p.rotation % 360 != 0).then_some(p.rotation % 360),
+        svg,
+        spans,
+        body,
+    );
+}
+
+fn push_sheet_figure_layout(
+    no: usize,
+    shown_w: f32,
+    shown_h: f32,
+    inner_aspect: f32,
+    turn: Option<u16>,
+    svg: &str,
+    spans: &str,
+    body: &mut String,
+) {
     body.push_str(&format!(
         "<figure id=\"p{no}\">\n<div class=\"frame\" style=\"aspect-ratio:{:.4}\">\n<div class=\"sheet{}\" style=\"aspect-ratio:{:.4}\">\n{svg}{spans}</div>\n</div>\n</figure>\n",
         shown_w / shown_h,
-        match p.rotation % 360 {
+        match turn.unwrap_or(0) {
             90 => " turn90",
             180 => " turn180",
             270 => " turn270",
             _ => "",
         },
-        pw / ph,
+        inner_aspect,
     ));
+}
+
+/// Some encoded pages already carry the quarter-turned device frame. Rotate
+/// only members whose native frame is still in the paper's original
+/// orientation; otherwise the content is turned twice and shrinks into a
+/// narrow strip.
+fn sheet_turn(p: &Page, main: Option<&Metafile>, shown_w: f32, shown_h: f32) -> Option<u16> {
+    let rotation = p.rotation % 360;
+    if rotation == 180 {
+        return Some(rotation);
+    }
+    if rotation % 180 != 90 {
+        return None;
+    }
+    let target_landscape = shown_w > shown_h;
+    let native_landscape = main
+        .map(|meta| {
+            let (w, h) = meta.points();
+            w > h
+        })
+        .unwrap_or(!target_landscape);
+    (native_landscape != target_landscape).then_some(rotation)
 }
 
 /// Decode and draw the normal page overlays into temporary layer strings.
@@ -1132,6 +1200,7 @@ fn draw_page_overlays<D: PageDecoder + ?Sized>(
         };
         let mut place = match overlay.area {
             None => Place::SHEET,
+            Some((x, y, w, h)) if covers_paper((x, y, w, h), paper) => Place::SHEET,
             Some((x, y, w, h)) => Place {
                 x: x as f32 * PT / pw,
                 y: y as f32 * PT / ph,
@@ -1157,7 +1226,9 @@ fn draw_page_overlays<D: PageDecoder + ?Sized>(
         } else {
             &[]
         };
-        layer.drawn.add(draw_metafile(
+        let mut overlay_svg = String::new();
+        let mut overlay_spans = String::new();
+        let overlay_drawn = draw_metafile(
             &m,
             data,
             stored,
@@ -1165,11 +1236,41 @@ fn draw_page_overlays<D: PageDecoder + ?Sized>(
             &format!("o{n}"),
             no,
             t,
-            &mut layer.svg,
-            &mut layer.spans,
-        ));
+            &mut overlay_svg,
+            &mut overlay_spans,
+        );
+        let turn = html_component_rotation(&m, (pw, ph), p.rotation);
+        if turn == 0 {
+            layer.content.push_str(&overlay_svg);
+            layer.content.push_str(&overlay_spans);
+        } else {
+            layer.content.push_str(&format!(
+                "<div class=\"layer turn{turn}\">{overlay_svg}{overlay_spans}</div>\n"
+            ));
+        }
+        layer.drawn.add(overlay_drawn);
     }
     layer
+}
+
+fn covers_paper(area: (u32, u32, u32, u32), paper: (u32, u32)) -> bool {
+    let (x, y, w, h) = area;
+    let (pw, ph) = paper;
+    x <= pw / 20 && y <= ph / 20 && w >= pw.saturating_mul(9) / 10 && h >= ph.saturating_mul(9) / 10
+}
+
+fn html_component_rotation(meta: &Metafile, target: (f32, f32), rotation: u16) -> u16 {
+    let rotation = rotation % 360;
+    if rotation % 180 != 90 {
+        return 0;
+    }
+    let (mw, mh) = meta.points();
+    if mw <= 0.0 || mh <= 0.0 {
+        return 0;
+    }
+    ((mw > mh) != (target.0 > target.1))
+        .then_some(rotation)
+        .unwrap_or(0)
 }
 
 /// Draw one logical displayed page whose properties record places several
@@ -1215,6 +1316,9 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
         let Some(page) = doc.pages.get(member.page_index) else {
             continue;
         };
+        if recovery::preview_replaced_by_text_overlay(page, &display.overlays, paper, decoder) {
+            continue;
+        }
         let place = member
             .area
             .map(|area| display_area_place(area, pw, ph))
@@ -1239,7 +1343,9 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
                 drawn.painted = true;
                 recovered = true;
             }
-            PageData::Encoded { .. } | PageData::Preview { .. } if decode => {
+            PageData::Encoded { .. } | PageData::Preview { .. } | PageData::Bare { .. }
+                if decode =>
+            {
                 let Some(meta) = recovery::decode_page_for_document(data, page, doc, decoder)
                 else {
                     continue;
@@ -1264,56 +1370,62 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
         }
     }
 
-    if let Some(member) = display.members.first() {
-        if let Some(anchor) = doc.pages.get(member.page_index) {
-            let mut group: Vec<&Page> = doc.pictures_on(anchor.index).collect();
-            if anchor.is_recoverable() {
-                group.push(anchor);
-                group.sort_by_key(|page| page.index);
-            }
-            for (n, overlay) in display.overlays.iter().enumerate() {
-                let Some(meta) = decoder.decode_overlay(overlay, paper) else {
-                    continue;
-                };
-                let mut place = overlay
-                    .area
-                    .map(|area| display_area_place(area, pw, ph))
-                    .unwrap_or(Place::SHEET);
-                if is_point_sized_text(overlay, &meta) {
-                    place = fit_text_place(place, &meta, pw, ph);
-                }
-                // The properties rectangle controls placement only.  A
-                // full-page overlay may still refer to the pictures stored
-                // beside its anchor; the source uses exactly that form.
-                let uses_stored = meta
-                    .images
-                    .iter()
-                    .any(|image| matches!(image.source, Source::Stored { .. }));
-                let stored: &[&Page] = if overlay.area.is_none() || uses_stored {
-                    &group
-                } else {
-                    &[]
-                };
-                let overlay_drawn = draw_metafile(
-                    &meta,
-                    data,
-                    stored,
-                    place,
-                    &format!("do{n}"),
-                    no,
-                    t,
-                    &mut svg,
-                    &mut spans,
-                );
-                drawn.add(overlay_drawn);
-                recovered |= overlay_drawn.painted;
-            }
+    let anchor = display
+        .members
+        .first()
+        .and_then(|member| doc.pages.get(member.page_index));
+    let mut group: Vec<&Page> = anchor
+        .map(|page| doc.pictures_on(page.index).collect())
+        .unwrap_or_default();
+    if let Some(anchor) = anchor.filter(|page| page.is_recoverable()) {
+        group.push(anchor);
+        group.sort_by_key(|page| page.index);
+    }
+    for (n, overlay) in display.overlays.iter().enumerate() {
+        let Some(meta) = decoder.decode_overlay(overlay, paper) else {
+            continue;
+        };
+        let mut place = overlay
+            .area
+            .map(|area| display_area_place(area, pw, ph))
+            .unwrap_or(Place::SHEET);
+        if is_point_sized_text(overlay, &meta) {
+            place = fit_text_place(place, &meta, pw, ph);
         }
+        // The properties rectangle controls placement only.  A full-page
+        // overlay may still refer to the pictures stored beside its anchor;
+        // the source uses exactly that form.  Text/vector overlays without an
+        // anchor are valid too, so an empty picture group is intentional.
+        let uses_stored = meta
+            .images
+            .iter()
+            .any(|image| matches!(image.source, Source::Stored { .. }));
+        let stored: &[&Page] = if overlay.area.is_none() || uses_stored {
+            &group
+        } else {
+            &[]
+        };
+        let overlay_drawn = draw_metafile(
+            &meta,
+            data,
+            stored,
+            place,
+            &format!("do{n}"),
+            no,
+            t,
+            &mut svg,
+            &mut spans,
+        );
+        drawn.add(overlay_drawn);
+        recovered |= overlay_drawn.painted;
     }
 
     // The properties stream can explicitly retain a blank logical page even
     // when the page table has no body to attach to it.
     if display.members.is_empty() && display.overlays.is_empty() {
+        recovered = true;
+    }
+    if recovery::display_page_is_explicit_blank(display, decoder) {
         recovered = true;
     }
 
@@ -1343,12 +1455,31 @@ fn draw_display_sheet<D: PageDecoder + ?Sized>(
 /// Use the occupied drawing box for a composed vector member whose EMF device
 /// extent is clearly much larger than the artwork it contains.
 fn member_viewbox(area: Option<(u32, u32, u32, u32)>, meta: &Metafile) -> Option<Rect> {
-    let _ = area?;
-    let bounds = meta.content_bounds()?;
+    let (_, _, area_w, area_h) = area?;
+    let frame_w = meta.frame_mm100.0.unsigned_abs() as f32;
+    let frame_h = meta.frame_mm100.1.unsigned_abs() as f32;
     let (dw, dh) = (
         meta.device.0.unsigned_abs() as f32,
         meta.device.1.unsigned_abs() as f32,
     );
+    let aspect_mismatch = frame_w > 0.0
+        && frame_h > 0.0
+        && dw > 0.0
+        && dh > 0.0
+        && ((frame_w / frame_h) / (dw / dh)).ln().abs() > 0.02;
+    // A full-paper member uses the metafile's native coordinate system.  Its
+    // artwork may occupy only a small part of the page (for example a footer),
+    // but replacing the page viewBox with that artwork box would enlarge its
+    // text and vector strokes to fill the whole paper.  Annotation stamp
+    // members are the exception: their stored device canvas is often a
+    // screen-sized 16:9 canvas inside a square/portrait properties frame.
+    if frame_w <= 0.0
+        || frame_h <= 0.0
+        || (area_w as f32 >= frame_w * 0.9 && area_h as f32 >= frame_h * 0.9 && !aspect_mismatch)
+    {
+        return None;
+    }
+    let bounds = meta.content_bounds()?;
     if dw <= 0.0 || dh <= 0.0 || bounds.width() >= dw * 0.5 || bounds.height() >= dh * 0.5 {
         return None;
     }
@@ -1371,11 +1502,29 @@ fn display_area_place((x, y, w, h): (u32, u32, u32, u32), pw: f32, ph: f32) -> P
 /// behavior.
 fn is_point_sized_text(overlay: &crate::domain::page::Overlay, meta: &Metafile) -> bool {
     overlay.area.is_some()
+        && !covers_frame(overlay.area, meta.frame_mm100)
         && !meta.text.is_empty()
         && meta.images.is_empty()
         && meta.rasters.is_empty()
         && meta.fills.is_empty()
         && meta.shapes.is_empty()
+}
+
+/// A full-sheet text overlay is already expressed in page coordinates.  It is
+/// not a point-sized annotation: fitting its occupied text box would enlarge
+/// the layer past the page and place footer text outside the sheet.
+fn covers_frame(area: Option<(u32, u32, u32, u32)>, frame: (i32, i32)) -> bool {
+    let Some((x, y, w, h)) = area else {
+        return false;
+    };
+    let fw = frame.0.unsigned_abs() as f32;
+    let fh = frame.1.unsigned_abs() as f32;
+    fw > 0.0
+        && fh > 0.0
+        && (x as f32) <= fw * 0.05
+        && (y as f32) <= fh * 0.05
+        && (w as f32) >= fw * 0.9
+        && (h as f32) >= fh * 0.9
 }
 
 /// Fit text-only annotation contents to their properties rectangle.  A few
@@ -1808,6 +1957,32 @@ mod tests {
         // The JPEG is emitted only through the stored-picture overlay. A
         // second full-sheet copy would recreate the opaque edge background.
         assert_eq!(html.matches("<img class=\"art\"").count(), 0);
+    }
+
+    #[test]
+    fn a_full_paper_member_keeps_its_native_text_scale() {
+        let meta = Metafile {
+            device: (4961, 7016),
+            frame_mm100: (21000, 29700),
+            fills: vec![crate::domain::rendering::Fill {
+                left: 100.0,
+                top: 100.0,
+                right: 200.0,
+                bottom: 200.0,
+                rgb: (0, 0, 0),
+                blend: crate::domain::rendering::BlendMode::Normal,
+                order: 0,
+                clip: None,
+                clip_path: None,
+            }],
+            ..Default::default()
+        };
+        assert!(super::member_viewbox(Some((0, 0, 21000, 29700)), &meta).is_none());
+        assert!(super::member_viewbox(Some((0, 0, 10000, 14000)), &meta).is_some());
+        let mut stamp = meta.clone();
+        stamp.device = (2560, 1440);
+        stamp.frame_mm100 = (1909, 1909);
+        assert!(super::member_viewbox(Some((0, 0, 1909, 1909)), &stamp).is_some());
     }
 
     #[test]

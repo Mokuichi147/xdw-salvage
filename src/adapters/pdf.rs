@@ -651,9 +651,13 @@ where
                 continue;
             }
             page_no += 1;
-            // The page is drawn the way it is stored; the reader turns it the
-            // way the document says it is shown.
-            let rotate = if p.rotation % 360 != 0 {
+            // Quarter-turned pages are emitted with their displayed paper
+            // dimensions.  A `/Rotate` flag on the original portrait box
+            // would rotate an already-landscape metafile a second time and
+            // leave the drawing in a small strip of the page.
+            let rotate = if p.rotation % 180 == 90 {
+                String::new()
+            } else if p.rotation % 360 != 0 {
                 format!(" /Rotate {}", p.rotation % 360)
             } else {
                 String::new()
@@ -670,9 +674,14 @@ where
                         .map(|i| (i.width, i.height))
                         .or(p.pixels)
                         .unwrap_or((1, 1));
-                    let natural = pdf_paper_points(p.paper)
+                    let native_natural = pdf_paper_points(p.paper)
                         .or_else(|| info.map(|i| i.points()))
                         .unwrap_or((w_px as f32, h_px as f32));
+                    let natural = if p.rotation % 180 == 90 {
+                        (native_natural.1, native_natural.0)
+                    } else {
+                        native_natural
+                    };
                     let (pw, ph) = opts.paper.unwrap_or(natural);
 
                     // A picture page may carry a drawing of its own that says
@@ -685,7 +694,8 @@ where
                             &mut w,
                             data,
                             doc,
-                            p,
+                            Some(p),
+                            p.paper.unwrap_or((21000, 29700)),
                             &p.overlays,
                             decoder,
                             pw,
@@ -696,6 +706,7 @@ where
                             &mut used_glyphs,
                             &mut glyph_widths,
                             &mut glyph_remapper,
+                            p.rotation,
                         )
                     } else {
                         Drawn {
@@ -862,35 +873,58 @@ where
                 // The sheet is in the container's own coding. Expand it: what comes
                 // out is a metafile, and its text is real text with real positions,
                 // so the page can be redrawn rather than apologised for.
-                PageData::Encoded { .. } | PageData::Preview { .. } if decoded.is_some() => {
+                PageData::Encoded { .. } | PageData::Preview { .. } | PageData::Bare { .. }
+                    if decoded.is_some() =>
+                {
                     let meta = decoded.as_ref().expect("decoded guard above");
                     let (nw, nh) = meta.points();
-                    let (pw, ph) = opts
-                        .paper
-                        .or_else(|| pdf_paper_points(p.paper))
+                    let native_paper = pdf_paper_points(p.paper)
                         .unwrap_or(if nw > 1.0 && nh > 1.0 { (nw, nh) } else { A4 });
+                    let shown_paper = if p.rotation % 180 == 90 {
+                        (native_paper.1, native_paper.0)
+                    } else {
+                        native_paper
+                    };
+                    let (pw, ph) = opts.paper.unwrap_or(shown_paper);
                     let mut content = String::new();
                     let mut xobjects = String::new();
                     let stored: Vec<&Page> = doc.pictures_on(p.index).collect();
-                    let drawn = draw_page(
+                    let target = Place::sheet(pw, ph);
+                    let turn = component_rotation(meta, (pw, ph), p.rotation);
+                    let (draw_place, matrix) = if turn == 0 {
+                        (target, None)
+                    } else {
+                        oriented_place(target, meta, turn)
+                    };
+                    let mut main_content = String::new();
+                    let mut main_xobjects = String::new();
+                    let drawn = draw_page_with_viewbox(
                         &mut w,
                         data,
                         &stored,
                         meta,
-                        Place::sheet(pw, ph),
+                        draw_place,
                         "M",
-                        &mut content,
-                        &mut xobjects,
+                        &mut main_content,
+                        &mut main_xobjects,
                         opts.font.as_deref(),
                         &mut used_glyphs,
                         &mut glyph_widths,
                         &mut glyph_remapper,
+                        None,
                     );
+                    if let Some(matrix) = matrix {
+                        append_matrix(&mut content, matrix, &main_content);
+                    } else {
+                        content.push_str(&main_content);
+                    }
+                    xobjects.push_str(&main_xobjects);
                     let over = draw_overlay_list(
                         &mut w,
                         data,
                         doc,
-                        p,
+                        Some(p),
+                        p.paper.unwrap_or((21000, 29700)),
                         &p.overlays,
                         decoder,
                         pw,
@@ -901,6 +935,7 @@ where
                         &mut used_glyphs,
                         &mut glyph_widths,
                         &mut glyph_remapper,
+                        p.rotation,
                     );
                     let (glyphs, placed) =
                         (drawn.glyphs + over.glyphs, drawn.pictures + over.pictures);
@@ -962,7 +997,8 @@ where
                             &mut w,
                             data,
                             doc,
-                            p,
+                            Some(p),
+                            p.paper.unwrap_or((21000, 29700)),
                             &p.overlays,
                             decoder,
                             pw,
@@ -973,6 +1009,7 @@ where
                             &mut used_glyphs,
                             &mut glyph_widths,
                             &mut glyph_remapper,
+                            p.rotation,
                         )
                     } else {
                         Drawn {
@@ -2200,6 +2237,9 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
         let Some(page) = doc.pages.get(member.page_index) else {
             continue;
         };
+        if recovery::preview_replaced_by_text_overlay(page, &display.overlays, paper, decoder) {
+            continue;
+        }
         let place = member
             .area
             .map(|area| area_place(area, ph))
@@ -2222,13 +2262,20 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
                     recovered = true;
                 }
             }
-            PageData::Encoded { .. } | PageData::Preview { .. } if decode => {
+            PageData::Encoded { .. } | PageData::Preview { .. } | PageData::Bare { .. }
+                if decode =>
+            {
                 if let Some(meta) = recovery::decode_page_for_document(data, page, doc, decoder) {
                     let stored = doc.pictures_on(page.index).collect::<Vec<_>>();
                     let mut member_content = String::new();
                     let mut member_xobjects = String::new();
                     let viewbox = member_viewbox(member.area, &meta);
-                    let (draw_place, matrix) = oriented_place(place, &meta, display.rotation);
+                    let turn = component_rotation(&meta, (place.w, place.h), display.rotation);
+                    let (draw_place, matrix) = if turn == 0 {
+                        (place, None)
+                    } else {
+                        oriented_place(place, &meta, turn)
+                    };
                     let drawn = draw_page_with_viewbox(
                         w,
                         data,
@@ -2260,29 +2307,35 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
         }
     }
 
-    if let Some(member) = display.members.first() {
-        if let Some(anchor) = doc.pages.get(member.page_index) {
-            let drawn = draw_overlay_list(
-                w,
-                data,
-                doc,
-                anchor,
-                &display.overlays,
-                decoder,
-                pw,
-                ph,
-                &mut content,
-                &mut xobjects,
-                font,
-                used,
-                glyph_widths,
-                remapper,
-            );
-            recovered |= drawn.painted;
-            total.glyphs += drawn.glyphs;
-            total.pictures += drawn.pictures;
-            total.painted |= drawn.painted;
-        }
+    let anchor = display
+        .members
+        .first()
+        .and_then(|member| doc.pages.get(member.page_index));
+    let drawn = draw_overlay_list(
+        w,
+        data,
+        doc,
+        anchor,
+        paper,
+        &display.overlays,
+        decoder,
+        pw,
+        ph,
+        &mut content,
+        &mut xobjects,
+        font,
+        used,
+        glyph_widths,
+        remapper,
+        display.rotation,
+    );
+    recovered |= drawn.painted;
+    total.glyphs += drawn.glyphs;
+    total.pictures += drawn.pictures;
+    total.painted |= drawn.painted;
+
+    if recovery::display_page_is_explicit_blank(display, decoder) {
+        recovered = true;
     }
 
     // Some printer exports preserve explicit blank logical pages in the
@@ -2313,12 +2366,31 @@ fn draw_display_page<D: PageDecoder + ?Sized>(
 /// the actual displayed object, so use the occupied drawing box as the local
 /// viewBox when the metafile clearly has that mismatch.
 fn member_viewbox(area: Option<(u32, u32, u32, u32)>, meta: &Metafile) -> Option<Rect> {
-    let _ = area?;
-    let bounds = meta.content_bounds()?;
+    let (_, _, area_w, area_h) = area?;
+    let frame_w = meta.frame_mm100.0.unsigned_abs() as f32;
+    let frame_h = meta.frame_mm100.1.unsigned_abs() as f32;
     let (dw, dh) = (
         meta.device.0.unsigned_abs() as f32,
         meta.device.1.unsigned_abs() as f32,
     );
+    let aspect_mismatch = frame_w > 0.0
+        && frame_h > 0.0
+        && dw > 0.0
+        && dh > 0.0
+        && ((frame_w / frame_h) / (dw / dh)).ln().abs() > 0.02;
+    // A full-paper member uses the metafile's native coordinate system.  Its
+    // artwork may occupy only a small part of the page (for example a footer),
+    // but replacing the page viewBox with that artwork box would enlarge its
+    // text and vector strokes to fill the whole paper.  Annotation stamp
+    // members are the exception: their stored device canvas is often a
+    // screen-sized 16:9 canvas inside a square/portrait properties frame.
+    if frame_w <= 0.0
+        || frame_h <= 0.0
+        || (area_w as f32 >= frame_w * 0.9 && area_h as f32 >= frame_h * 0.9 && !aspect_mismatch)
+    {
+        return None;
+    }
+    let bounds = meta.content_bounds()?;
     if dw <= 0.0 || dh <= 0.0 || bounds.width() >= dw * 0.5 || bounds.height() >= dh * 0.5 {
         return None;
     }
@@ -2398,7 +2470,8 @@ fn draw_overlay_list<D: PageDecoder + ?Sized>(
     w: &mut Writer,
     data: &[u8],
     doc: &Document,
-    p: &Page,
+    p: Option<&Page>,
+    paper: (u32, u32),
     overlays: &[Overlay],
     decoder: &D,
     pw: f32,
@@ -2409,6 +2482,7 @@ fn draw_overlay_list<D: PageDecoder + ?Sized>(
     used: &mut BTreeMap<u16, char>,
     glyph_widths: &mut BTreeMap<u16, u16>,
     remapper: &mut Option<subsetter::GlyphRemapper>,
+    rotation: u16,
 ) -> Drawn {
     const PT: f32 = 72.0 / 2540.0;
     let mut total = Drawn {
@@ -2416,12 +2490,13 @@ fn draw_overlay_list<D: PageDecoder + ?Sized>(
         pictures: 0,
         painted: false,
     };
-    let paper = p.paper.unwrap_or((21000, 29700));
     // A page overlay names every picture of the page in storage order, the
     // sheet's own included when the sheet is itself a picture.
-    let mut group: Vec<&Page> = doc.pictures_on(p.index).collect();
-    if p.is_recoverable() {
-        group.push(p);
+    let mut group: Vec<&Page> = p
+        .map(|page| doc.pictures_on(page.index).collect())
+        .unwrap_or_default();
+    if let Some(page) = p.filter(|page| page.is_recoverable()) {
+        group.push(page);
         group.sort_by_key(|q| q.index);
     }
     for (n, overlay) in overlays.iter().enumerate() {
@@ -2430,6 +2505,7 @@ fn draw_overlay_list<D: PageDecoder + ?Sized>(
         };
         let mut place = match overlay.area {
             None => Place::sheet(pw, ph),
+            Some((x, y, aw, ah)) if covers_paper((x, y, aw, ah), paper) => Place::sheet(pw, ph),
             Some((x, y, aw, ah)) => Place {
                 x: x as f32 * PT,
                 top: y as f32 * PT,
@@ -2458,20 +2534,35 @@ fn draw_overlay_list<D: PageDecoder + ?Sized>(
         } else {
             &[]
         };
-        let d = draw_page(
+        let mut layer = String::new();
+        let mut layer_xobjects = String::new();
+        let component_rotation = component_rotation(&meta, (place.w, place.h), rotation);
+        let (draw_place, matrix) = if component_rotation == 0 {
+            (place, None)
+        } else {
+            oriented_place(place, &meta, component_rotation)
+        };
+        let d = draw_page_with_viewbox(
             w,
             data,
             stored,
             &meta,
-            place,
+            draw_place,
             &format!("O{n}"),
-            out,
-            xobjects,
+            &mut layer,
+            &mut layer_xobjects,
             font,
             used,
             glyph_widths,
             remapper,
+            None,
         );
+        if let Some(matrix) = matrix {
+            append_matrix(out, matrix, &layer);
+        } else {
+            out.push_str(&layer);
+        }
+        xobjects.push_str(&layer_xobjects);
         total.glyphs += d.glyphs;
         total.pictures += d.pictures;
         total.painted |= d.painted;
@@ -2484,11 +2575,52 @@ fn draw_overlay_list<D: PageDecoder + ?Sized>(
 /// artwork must continue to scale to their declared rectangle.
 fn is_point_sized_text(overlay: &Overlay, meta: &Metafile) -> bool {
     overlay.area.is_some()
+        && !covers_frame(overlay.area, meta.frame_mm100)
         && !meta.text.is_empty()
         && meta.images.is_empty()
         && meta.rasters.is_empty()
         && meta.fills.is_empty()
         && meta.shapes.is_empty()
+}
+
+/// A full-sheet text overlay is already expressed in page coordinates.  It is
+/// not a point-sized annotation: fitting its occupied text box would enlarge
+/// the layer past the page and clip footer text outside the MediaBox.
+fn covers_frame(area: Option<(u32, u32, u32, u32)>, frame: (i32, i32)) -> bool {
+    let Some((x, y, w, h)) = area else {
+        return false;
+    };
+    let fw = frame.0.unsigned_abs() as f32;
+    let fh = frame.1.unsigned_abs() as f32;
+    fw > 0.0
+        && fh > 0.0
+        && (x as f32) <= fw * 0.05
+        && (y as f32) <= fh * 0.05
+        && (w as f32) >= fw * 0.9
+        && (h as f32) >= fh * 0.9
+}
+
+/// Apply a quarter-turn only when a decoded member's own frame is not already
+/// in the displayed orientation.  Some writers store the frame after the
+/// turn, while their properties still retain the original rotation flag.
+fn component_rotation(meta: &Metafile, target: (f32, f32), rotation: u16) -> u16 {
+    let rotation = rotation % 360;
+    if rotation % 180 != 90 {
+        return 0;
+    }
+    let (mw, mh) = meta.points();
+    if mw <= 0.0 || mh <= 0.0 {
+        return 0;
+    }
+    ((mw > mh) != (target.0 > target.1))
+        .then_some(rotation)
+        .unwrap_or(0)
+}
+
+fn covers_paper(area: (u32, u32, u32, u32), paper: (u32, u32)) -> bool {
+    let (x, y, w, h) = area;
+    let (pw, ph) = paper;
+    x <= pw / 20 && y <= ph / 20 && w >= pw.saturating_mul(9) / 10 && h >= ph.saturating_mul(9) / 10
 }
 
 /// Fit text-only annotation contents to their properties rectangle.  Some
@@ -3121,5 +3253,31 @@ mod tests {
         assert!((placed.top - 95.0).abs() < 0.01);
         assert!((placed.w - 100.0).abs() < 0.01);
         assert!((placed.h - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_full_paper_member_keeps_its_native_text_scale() {
+        let meta = Metafile {
+            device: (4961, 7016),
+            frame_mm100: (21000, 29700),
+            fills: vec![crate::domain::rendering::Fill {
+                left: 100.0,
+                top: 100.0,
+                right: 200.0,
+                bottom: 200.0,
+                rgb: (0, 0, 0),
+                blend: crate::domain::rendering::BlendMode::Normal,
+                order: 0,
+                clip: None,
+                clip_path: None,
+            }],
+            ..Default::default()
+        };
+        assert!(super::member_viewbox(Some((0, 0, 21000, 29700)), &meta).is_none());
+        assert!(super::member_viewbox(Some((0, 0, 10000, 14000)), &meta).is_some());
+        let mut stamp = meta.clone();
+        stamp.device = (2560, 1440);
+        stamp.frame_mm100 = (1909, 1909);
+        assert!(super::member_viewbox(Some((0, 0, 1909, 1909)), &stamp).is_some());
     }
 }

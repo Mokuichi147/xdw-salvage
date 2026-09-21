@@ -75,7 +75,64 @@ pub fn display_page_is_recoverable<D: PageDecoder + ?Sized>(
             .is_some_and(|page| page_is_recoverable(data, page, document, decoder))
     }) || display.overlays.iter().any(|overlay| {
         decode_overlay(decoder, overlay, display.paper.unwrap_or((21000, 29700))).is_some()
-    }) || (display.members.is_empty() && display.overlays.is_empty())
+    }) || display_page_is_explicit_blank(display, decoder)
+        || (display.members.is_empty() && display.overlays.is_empty())
+}
+
+/// Whether a properties-only display page contains a valid drawing which is
+/// intentionally empty.  A few drivers store a blank page as a full-page EMF
+/// containing only its header/background setup; it must not become a missing
+/// page merely because there is no visible primitive to paint.
+pub fn display_page_is_explicit_blank<D: PageDecoder + ?Sized>(
+    display: &DisplayPage,
+    decoder: &D,
+) -> bool {
+    if !display.members.is_empty() || display.overlays.is_empty() {
+        return false;
+    }
+    let paper = display.paper.unwrap_or((21000, 29700));
+    display.overlays.iter().all(|overlay| {
+        decoder
+            .decode_overlay(overlay, paper)
+            .is_some_and(|drawing| drawing.is_empty())
+    })
+}
+
+/// A small standalone preview is only a thumbnail when a full-sheet text
+/// overlay supplies the page's selectable vector content.  Keeping both
+/// layers makes the thumbnail's coarse glyph pixels visible beside the clean
+/// overlay; in that specific composition the preview is redundant.
+pub fn preview_replaced_by_text_overlay<D: PageDecoder + ?Sized>(
+    page: &Page,
+    overlays: &[crate::domain::page::Overlay],
+    paper: (u32, u32),
+    decoder: &D,
+) -> bool {
+    if !matches!(page.data, crate::domain::page::PageData::Preview { .. })
+        || page.is_full_size_preview()
+    {
+        return false;
+    }
+    overlays.iter().any(|overlay| {
+        let Some((x, y, w, h)) = overlay.area else {
+            return false;
+        };
+        if x > paper.0 / 20
+            || y > paper.1 / 20
+            || w < paper.0.saturating_mul(9) / 10
+            || h < paper.1.saturating_mul(9) / 10
+        {
+            return false;
+        }
+        decoder.decode_overlay(overlay, paper).is_some_and(|meta| {
+            !meta.text.is_empty()
+                && meta.images.is_empty()
+                && meta.rasters.is_empty()
+                && meta.fills.is_empty()
+                && meta.shapes.is_empty()
+                && meta.paths.is_empty()
+        })
+    })
 }
 
 /// Calculate coverage using the structural facts in `Document` and the

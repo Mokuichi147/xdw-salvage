@@ -2,9 +2,9 @@
 
 use crate::application::ports::PageDecoder;
 use crate::domain::page::{Overlay, Page, PageData};
-use crate::domain::rendering::{Image, Metafile, Raster, RasterOp, Source};
+use crate::domain::rendering::{FontKind, Image, Metafile, Raster, RasterOp, Source, Text};
 use crate::domain::Document;
-use crate::infrastructure::{ccitt, dib, emf, lzh, wmf};
+use crate::infrastructure::{ccitt, cp932, dib, emf, lzh, wmf};
 
 const KIND_BITMAP: u64 = 7;
 const KIND_GROUP4: u64 = 9;
@@ -18,6 +18,13 @@ impl PageDecoder for LzhMetafileDecoder {
     fn decode(&self, data: &[u8], page: &Page) -> Option<Metafile> {
         if matches!(page.data, PageData::Preview { .. }) {
             return preview_metafile(data, page);
+        }
+        if let PageData::Bare { offset, len } = page.data {
+            let end = offset.checked_add(len)?;
+            let coded = data.get(offset..end)?;
+            return page
+                .paper
+                .and_then(|paper| bare_text_metafile(coded, paper));
         }
         let PageData::Encoded {
             offset,
@@ -84,7 +91,163 @@ impl PageDecoder for LzhMetafileDecoder {
         let raw = lzh::decode(&overlay.coded, overlay.expanded).ok()?;
         // An annotation's frame is its own box; a page overlay's is the page.
         let frame = overlay.area.map(|(_, _, w, h)| (w, h)).unwrap_or(paper);
-        metafile(&raw, frame).filter(|metafile| !metafile.is_empty())
+        // Keep a successfully decoded but empty metafile.  Some exports use
+        // a full-page EMF containing only a white background as an explicit
+        // blank logical page; the application layer distinguishes that from
+        // an undecodable overlay.
+        metafile(&raw, frame)
+    }
+}
+
+/// Recover the plain-text page bodies emitted by several early DocuWorks
+/// writers.  These entries have no page-data metadata: their body is simply
+/// an LZH stream containing CP932 text terminated by NUL.
+fn bare_text_metafile(coded: &[u8], paper: (u32, u32)) -> Option<Metafile> {
+    const MAX_EXPANDED: usize = 4 * 1024 * 1024;
+    let prefix = lzh::decode(coded, 8).ok()?;
+    if prefix.starts_with(b"%PDF-")
+        || prefix.starts_with(b"PK\x03\x04")
+        || prefix.starts_with(&[0xD0, 0xCF, 0x11, 0xE0])
+    {
+        return None;
+    }
+
+    let expanded = lzh_expanded_len(coded, MAX_EXPANDED)?;
+    let raw = lzh::decode(coded, expanded).ok()?;
+    let end = raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len());
+    let raw = &raw[..end];
+    if raw.is_empty() {
+        return None;
+    }
+    let chars = cp932::decode(raw);
+    if chars.is_empty() {
+        return None;
+    }
+    let replacement = chars.iter().filter(|&&ch| ch == '\u{FFFD}').count();
+    let controls = chars
+        .iter()
+        .filter(|&&ch| ch.is_control() && !matches!(ch, '\r' | '\n' | '\t'))
+        .count();
+    if replacement.saturating_mul(20) > chars.len() || controls.saturating_mul(20) > chars.len() {
+        return None;
+    }
+    let printable = chars
+        .iter()
+        .filter(|&&ch| !ch.is_whitespace() && !ch.is_control())
+        .count();
+    if printable < 2 {
+        return None;
+    }
+
+    Some(text_metafile(&chars, paper))
+}
+
+/// Find the largest output length accepted by the length-less LZH stream.
+/// `lzh::decode` deliberately accepts prefixes, so a bounded binary search
+/// recovers the exact stream length without trusting a missing page header.
+fn lzh_expanded_len(coded: &[u8], maximum: usize) -> Option<usize> {
+    let mut low = 0usize;
+    let mut high = 64usize.min(maximum);
+    while high < maximum && lzh::decode(coded, high).is_ok() {
+        low = high;
+        high = high.saturating_mul(2).min(maximum);
+    }
+    if high == maximum && lzh::decode(coded, high).is_ok() {
+        return None;
+    }
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        if lzh::decode(coded, middle).is_ok() {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    (low > 0).then_some(low)
+}
+
+/// Turn a CP932 text body into a searchable page-sized drawing.  The source
+/// format does not preserve font metrics, so use a conservative monospaced
+/// layout and fit long records inside the declared paper.
+fn text_metafile(chars: &[char], paper: (u32, u32)) -> Metafile {
+    const MARGIN: f32 = 900.0;
+    const BASE_SIZE: f32 = 300.0;
+    let (width, height) = (paper.0 as f32, paper.1 as f32);
+    let max_width = (width - MARGIN * 2.0).max(BASE_SIZE);
+    let mut lines: Vec<Vec<char>> = Vec::new();
+    let mut line = Vec::new();
+    let mut line_width = 0.0;
+    let char_width = |ch: char, size: f32| {
+        if ch.is_ascii() || ('\u{ff61}'..='\u{ff9f}').contains(&ch) {
+            size * 0.55
+        } else {
+            size
+        }
+    };
+    let flush = |lines: &mut Vec<Vec<char>>, line: &mut Vec<char>, line_width: &mut f32| {
+        lines.push(std::mem::take(line));
+        *line_width = 0.0;
+    };
+    for &ch in chars {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            flush(&mut lines, &mut line, &mut line_width);
+            continue;
+        }
+        let ch = if ch == '\t' { ' ' } else { ch };
+        let advance = char_width(ch, BASE_SIZE);
+        if !line.is_empty() && line_width + advance > max_width {
+            flush(&mut lines, &mut line, &mut line_width);
+        }
+        line.push(ch);
+        line_width += advance;
+    }
+    if !line.is_empty() || lines.is_empty() {
+        flush(&mut lines, &mut line, &mut line_width);
+    }
+
+    let available = (height - MARGIN * 2.0).max(BASE_SIZE);
+    let line_step = BASE_SIZE * 1.35;
+    let size = (BASE_SIZE * (available / (lines.len().max(1) as f32 * line_step)).min(1.0))
+        .clamp(120.0, BASE_SIZE);
+    let step = size * 1.35;
+    let mut text = Vec::with_capacity(lines.len());
+    let mut y = MARGIN + size;
+    let mut order = 0usize;
+    for line in lines {
+        if y > height - MARGIN {
+            break;
+        }
+        let mut xs = Vec::with_capacity(line.len());
+        let mut x = MARGIN;
+        for &ch in &line {
+            xs.push(x);
+            x += char_width(ch, size);
+        }
+        if !line.is_empty() {
+            text.push(Text {
+                xs,
+                y,
+                chars: line,
+                font_kind: FontKind::Japanese,
+                size,
+                escapement: 0,
+                rgb: (0, 0, 0),
+                order,
+                bold: false,
+                underline: false,
+            });
+            order += 1;
+        }
+        y += step;
+    }
+    Metafile {
+        device: (paper.0 as i32, paper.1 as i32),
+        frame_mm100: (paper.0 as i32, paper.1 as i32),
+        text,
+        ..Default::default()
     }
 }
 
@@ -259,4 +422,34 @@ pub fn metafile(raw: &[u8], paper_mm100: (u32, u32)) -> Option<Metafile> {
         return Some(m);
     }
     wmf::read(raw, (paper_mm100.0 as i32, paper_mm100.1 as i32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_text_becomes_searchable_page_content() {
+        let chars = cp932::decode(b"Heading\r\nBody\0");
+        let meta = text_metafile(&chars, (21000, 29700));
+        assert_eq!(meta.text.len(), 2);
+        assert_eq!(meta.text[0].chars, "Heading".chars().collect::<Vec<_>>());
+        assert!(meta.text[1].y > meta.text[0].y);
+        assert!(!meta.is_empty());
+    }
+
+    #[test]
+    fn a_valid_empty_metafile_is_not_treated_as_undecodable() {
+        // A header-only EMF is a valid explicit blank drawing.  Keeping the
+        // empty model as Some lets the application layer distinguish it from
+        // an LZH or metafile parse failure.
+        let mut raw = [0u8; 144];
+        raw[0..4].copy_from_slice(&1u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&144u32.to_le_bytes());
+        raw[40..44].copy_from_slice(b" EMF");
+        raw[52..56].copy_from_slice(&1u32.to_le_bytes());
+        raw[72..76].copy_from_slice(&21000u32.to_le_bytes());
+        raw[76..80].copy_from_slice(&29700u32.to_le_bytes());
+        assert!(metafile(&raw, (21000, 29700)).is_some());
+    }
 }
